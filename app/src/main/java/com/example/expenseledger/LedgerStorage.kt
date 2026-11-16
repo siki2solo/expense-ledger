@@ -385,9 +385,7 @@ class LedgerDbHelper(context: Context) : SQLiteOpenHelper(context, "expense_ledg
             LabelRecord("lbl-vegetables", "#Vegetables", "Daily fresh market produce", "#059669", t1, t1, listOf(AuditEntry(action = "Created", at = t1, summary = "Seeded label")))
         )
         val lists = listOf(
-            ListNoteRecord("list-craft", "School Craft & Fees Breakdown", "Wood -> ₹5
-Fees -> ₹10
-Others -> ₹15", t2, t2, listOf(AuditEntry(action = "Created", at = t2, summary = "Created breakdown ₹30")))
+            ListNoteRecord("list-craft", "School Craft & Fees Breakdown", "Wood -> ₹5\nFees -> ₹10\nOthers -> ₹15", t2, t2, listOf(AuditEntry(action = "Created", at = t2, summary = "Created breakdown ₹30")))
         )
         val expenses = listOf(
             ExpenseRecord("exp-1", 850.0, "Pediatric checkup & vitamin prescription", ExpenseStatus.PAID, listOf("lbl-dr", "lbl-school"), emptyList(), null, null, t2, t2, listOf(AuditEntry(action = "Created", at = t2, summary = "Logged ₹850"))),
