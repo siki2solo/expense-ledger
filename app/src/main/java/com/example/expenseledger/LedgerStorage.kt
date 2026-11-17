@@ -472,7 +472,9 @@ object LedgerMath {
 
     fun formatReadableDate(iso: String): String {
         return try {
-            val parser = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss", Locale.US)
+            val parser = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss", Locale.US).apply {
+                timeZone = TimeZone.getTimeZone("UTC")
+            }
             val date = parser.parse(iso.take(19)) ?: return iso
             SimpleDateFormat("dd MMM yyyy, hh:mm:ss a", Locale.getDefault()).format(date)
         } catch (_: Exception) {
@@ -482,7 +484,9 @@ object LedgerMath {
 
     fun formatCompactDate(iso: String): String {
         return try {
-            val parser = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss", Locale.US)
+            val parser = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss", Locale.US).apply {
+                timeZone = TimeZone.getTimeZone("UTC")
+            }
             val date = parser.parse(iso.take(19)) ?: return iso
             SimpleDateFormat("dd-MM-yy HH:mm", Locale.getDefault()).format(date)
         } catch (_: Exception) {
@@ -522,13 +526,21 @@ object LedgerMath {
 
     fun sha256Pin(pin: String): String {
         val digest = MessageDigest.getInstance("SHA-256")
-        val bytes = digest.digest(("elpin-v1:" + pin.trim()).toByteArray(Charsets.UTF_8))
+        var bytes = ("elpin-v2:" + pin.trim()).toByteArray(Charsets.UTF_8)
+        repeat(10_000) {
+            digest.reset()
+            bytes = digest.digest(bytes)
+        }
         return bytes.joinToString("") { "%02x".format(it) }
     }
 
     fun verifyPin(pin: String, expectedHash: String?): Boolean {
         if (expectedHash.isNullOrBlank()) return true
-        return sha256Pin(pin) == expectedHash.lowercase(Locale.US)
+        val target = expectedHash.lowercase(Locale.US)
+        if (sha256Pin(pin) == target) return true
+        val digest = MessageDigest.getInstance("SHA-256")
+        val legacy = digest.digest(("elpin-v1:" + pin.trim()).toByteArray(Charsets.UTF_8))
+        return legacy.joinToString("") { "%02x".format(it) } == target
     }
 
     fun availableMonths(expenses: List<ExpenseRecord>): List<String> {
@@ -583,6 +595,31 @@ object LedgerMath {
     fun expenseRemainingPart(exp: ExpenseRecord): Double {
         if (exp.entryType == EntryType.INCOME) return 0.0
         return (exp.balance.coerceAtLeast(0.0) - expensePaidPart(exp)).coerceAtLeast(0.0)
+    }
+
+    fun trackedPartialSum(exp: ExpenseRecord): Double {
+        return kotlin.math.round(exp.partialPayments.sumOf { it.amount.coerceAtLeast(0.0) } * 100.0) / 100.0
+    }
+
+    fun cycleStatus(exp: ExpenseRecord): ExpenseRecord {
+        if (exp.entryType == EntryType.INCOME) return exp
+        val now = nowIso()
+        val nextStatus = exp.status.next()
+        val nextPaid = if (nextStatus == ExpenseStatus.PAID) {
+            exp.balance
+        } else {
+            minOf(exp.balance, trackedPartialSum(exp))
+        }
+        return exp.copy(
+            status = nextStatus,
+            paidAmount = nextPaid,
+            updatedAt = now,
+            auditLog = exp.auditLog + AuditEntry(
+                action = "Updated",
+                at = now,
+                summary = "Status changed from ${exp.status.label} to ${nextStatus.label}"
+            )
+        )
     }
 
     fun computeCashflowSummary(expenses: List<ExpenseRecord>, monthKey: String? = null): CashflowSummary {
@@ -792,13 +829,23 @@ object LedgerMath {
             val dueBills = snapshot.expenses.filter {
                 it.entryType == EntryType.EXPENSE && it.status != ExpenseStatus.PAID && it.dueDate == dateKey
             }
+            val fmtDate = SimpleDateFormat("yyyy-MM-dd", Locale.US).apply { timeZone = TimeZone.getTimeZone("UTC") }
+            val targetMs = try { fmtDate.parse(dateKey)?.time } catch (_: Exception) { null }
             val projected = snapshot.templates.filter { tpl ->
                 when (tpl.recurrence) {
                     RecurrenceCycle.MONTHLY -> {
-                        val anchorDay = (tpl.lastUsedAt ?: tpl.createdAt).drop(8).take(2).toIntOrNull() ?: 1
+                        val anchorDay = tpl.createdAt.drop(8).take(2).toIntOrNull() ?: 1
                         day == minOf(anchorDay, daysInMonth)
                     }
-                    RecurrenceCycle.WEEKLY -> day % 7 == 1
+                    RecurrenceCycle.WEEKLY -> {
+                        val baseStr = (tpl.lastUsedAt ?: tpl.createdAt).take(10)
+                        val baseMs = try { fmtDate.parse(baseStr)?.time } catch (_: Exception) { null }
+                        if (baseMs != null && targetMs != null && targetMs >= baseMs) {
+                            ((targetMs - baseMs) % (7L * MS_PER_DAY)) == 0L
+                        } else {
+                            false
+                        }
+                    }
                     RecurrenceCycle.NONE -> false
                 }
             }
@@ -985,9 +1032,36 @@ object LedgerMath {
                 }
             }
         }
-        snapshot.templates.filter { it.entryType == EntryType.EXPENSE && it.recurrence != RecurrenceCycle.NONE }.forEach { tpl ->
-            val mult = if (tpl.recurrence == RecurrenceCycle.WEEKLY) 4 else 1
-            items.add(ForecastItem(todayStr, "${tpl.title} (${tpl.recurrence.label} x$mult)", tpl.balance * mult, "recurring"))
+        val endMs = todayMs + 29L * MS_PER_DAY
+        snapshot.templates.filter { it.entryType == EntryType.EXPENSE && it.recurrence != RecurrenceCycle.NONE && it.balance > 0.0 }.forEach { tpl ->
+            val baseStr = (tpl.lastUsedAt ?: tpl.createdAt).take(10)
+            val baseMs = try { fmt.parse(baseStr)?.time } catch (_: Exception) { null }
+            if (baseMs != null) {
+                if (tpl.recurrence == RecurrenceCycle.WEEKLY) {
+                    var nextMs = if (tpl.lastUsedAt != null) baseMs + 7L * MS_PER_DAY else todayMs
+                    while (nextMs < todayMs) nextMs += 7L * MS_PER_DAY
+                    while (nextMs <= endMs) {
+                        val dKey = fmt.format(Date(nextMs))
+                        items.add(ForecastItem(dKey, "${tpl.title} (Weekly)", tpl.balance, "recurring"))
+                        nextMs += 7L * MS_PER_DAY
+                    }
+                } else if (tpl.recurrence == RecurrenceCycle.MONTHLY) {
+                    val anchorDay = baseStr.drop(8).take(2).toIntOrNull() ?: 1
+                    val startCal = Calendar.getInstance(TimeZone.getTimeZone("UTC")).apply { timeInMillis = todayMs }
+                    for (mOffset in 0..1) {
+                        val c = Calendar.getInstance(TimeZone.getTimeZone("UTC")).apply {
+                            set(startCal.get(Calendar.YEAR), startCal.get(Calendar.MONTH) + mOffset, 1, 0, 0, 0)
+                            set(Calendar.MILLISECOND, 0)
+                        }
+                        val dim = c.getActualMaximum(Calendar.DAY_OF_MONTH)
+                        c.set(Calendar.DAY_OF_MONTH, minOf(dim, anchorDay.coerceAtLeast(1)))
+                        val occMs = c.timeInMillis
+                        if (occMs in todayMs..endMs) {
+                            items.add(ForecastItem(fmt.format(Date(occMs)), "${tpl.title} (Monthly)", tpl.balance, "recurring"))
+                        }
+                    }
+                }
+            }
         }
         val outflow = kotlin.math.round(items.sumOf { it.amount } * 100.0) / 100.0
         val projected = kotlin.math.round((liquidCash - outflow) * 100.0) / 100.0
@@ -1015,35 +1089,49 @@ object LedgerMath {
         val iv = ByteArray(12).apply { SecureRandom().nextBytes(this) }
         val factory = SecretKeyFactory.getInstance("PBKDF2WithHmacSHA256")
         val spec = PBEKeySpec(cleanPass.toCharArray(), salt, 100_000, 256)
-        val keyBytes = factory.generateSecret(spec).encoded
-        val cipher = Cipher.getInstance("AES/GCM/NoPadding")
-        cipher.init(Cipher.ENCRYPT_MODE, SecretKeySpec(keyBytes, "AES"), GCMParameterSpec(128, iv))
-        val encrypted = cipher.doFinal(snapshotJson.toByteArray(Charsets.UTF_8))
-        return JSONObject().apply {
-            put("format", "expense-ledger-ebak-v1")
-            put("iterations", 100_000)
-            put("salt", Base64.encodeToString(salt, Base64.NO_WRAP))
-            put("iv", Base64.encodeToString(iv, Base64.NO_WRAP))
-            put("cipher", Base64.encodeToString(encrypted, Base64.NO_WRAP))
-        }.toString(2)
+        var keyBytes: ByteArray? = null
+        return try {
+            val encodedKey = factory.generateSecret(spec).encoded
+            keyBytes = encodedKey
+            val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+            cipher.init(Cipher.ENCRYPT_MODE, SecretKeySpec(encodedKey, "AES"), GCMParameterSpec(128, iv))
+            val encrypted = cipher.doFinal(snapshotJson.toByteArray(Charsets.UTF_8))
+            JSONObject().apply {
+                put("format", "expense-ledger-ebak-v1")
+                put("iterations", 100_000)
+                put("salt", Base64.encodeToString(salt, Base64.NO_WRAP))
+                put("iv", Base64.encodeToString(iv, Base64.NO_WRAP))
+                put("cipher", Base64.encodeToString(encrypted, Base64.NO_WRAP))
+            }.toString(2)
+        } finally {
+            spec.clearPassword()
+            keyBytes?.fill(0)
+        }
     }
 
     fun decryptEbakJson(rawEbak: String, passphrase: String): String? {
+        var spec: PBEKeySpec? = null
+        var keyBytes: ByteArray? = null
         return try {
             val obj = JSONObject(rawEbak)
             if (obj.optString("format") != "expense-ledger-ebak-v1") return null
-            val iterations = obj.optInt("iterations", 100_000).coerceAtLeast(1000)
+            val iterations = obj.optInt("iterations", 100_000).coerceIn(10_000, 500_000)
             val salt = Base64.decode(obj.getString("salt"), Base64.DEFAULT)
             val iv = Base64.decode(obj.getString("iv"), Base64.DEFAULT)
             val cipherBytes = Base64.decode(obj.getString("cipher"), Base64.DEFAULT)
             val factory = SecretKeyFactory.getInstance("PBKDF2WithHmacSHA256")
-            val spec = PBEKeySpec(passphrase.trim().toCharArray(), salt, iterations, 256)
-            val keyBytes = factory.generateSecret(spec).encoded
+            val pbeSpec = PBEKeySpec(passphrase.trim().toCharArray(), salt, iterations, 256)
+            spec = pbeSpec
+            val encodedKey = factory.generateSecret(pbeSpec).encoded
+            keyBytes = encodedKey
             val cipher = Cipher.getInstance("AES/GCM/NoPadding")
-            cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(keyBytes, "AES"), GCMParameterSpec(128, iv))
+            cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(encodedKey, "AES"), GCMParameterSpec(128, iv))
             String(cipher.doFinal(cipherBytes), Charsets.UTF_8)
         } catch (_: Exception) {
             null
+        } finally {
+            spec?.clearPassword()
+            keyBytes?.fill(0)
         }
     }
 
@@ -1323,9 +1411,9 @@ object LedgerMath {
             val matchMonth = monthKey.isNullOrBlank() || exp.createdAt.startsWith(monthKey)
             matchExpense && matchLabel && matchMonth
         }
-        val paid = filtered.filter { it.status == ExpenseStatus.PAID }.sumOf { it.balance }
-        val hold = filtered.filter { it.status == ExpenseStatus.HOLD }.sumOf { it.balance }
-        val need = filtered.filter { it.status == ExpenseStatus.NEED }.sumOf { it.balance }
+        val paid = filtered.sumOf { expensePaidPart(it) }
+        val hold = filtered.filter { it.status == ExpenseStatus.HOLD }.sumOf { expenseRemainingPart(it) }
+        val need = filtered.filter { it.status == ExpenseStatus.NEED }.sumOf { expenseRemainingPart(it) }
         val total = paid + hold + need
         val scopeName = targetLabel?.name ?: "All Expenses"
         val periodName = if (monthKey.isNullOrBlank()) "All Time" else monthKey
@@ -1349,10 +1437,13 @@ object LedgerMath {
     }
 
     private fun escapeCsv(raw: String): String {
-        return if (raw.contains(",") || raw.contains("\"") || raw.contains("\n") || raw.contains("\r")) {
-            "\"" + raw.replace("\"", "\"\"") + "\""
+        val startsFormula = raw.isNotEmpty() && (raw[0] == '=' || raw[0] == '+' || raw[0] == '-' || raw[0] == '@' || raw[0] == '\t' || raw[0] == '\r')
+        val isPlainNumber = Regex("""^-?\d+(?:\.\d+)?$""").matches(raw)
+        val safe = if (startsFormula && !isPlainNumber) "'$raw" else raw
+        return if (safe.contains(",") || safe.contains("\"") || safe.contains("\n") || safe.contains("\r")) {
+            "\"" + safe.replace("\"", "\"\"") + "\""
         } else {
-            raw
+            safe
         }
     }
 
@@ -1824,6 +1915,10 @@ class LedgerDbHelper(context: Context) : SQLiteOpenHelper(context, "expense_ledg
         })
         root.put("autoLockSeconds", snapshot.autoLockSeconds)
         return root.toString()
+    }
+
+    fun encodePublicBackupSnapshot(snapshot: LedgerSnapshot): String {
+        return encodeSnapshot(snapshot.copy(privacyPinHash = null, biometricEnabled = false))
     }
 
     fun decodeLabel(o: JSONObject): LabelRecord {
@@ -2335,40 +2430,48 @@ class LedgerDbHelper(context: Context) : SQLiteOpenHelper(context, "expense_ledg
 
     private fun createSeedSnapshot(): LedgerSnapshot {
         val t1 = "2026-11-10T09:15:00.000Z"
+        val t1Sch = "2026-11-10T09:18:00.000Z"
+        val t1Veg = "2026-11-10T09:22:00.000Z"
         val t2 = "2026-11-14T08:30:00.000Z"
+        val t3 = "2026-11-15T07:35:00.000Z"
+        val t4 = "2026-11-15T16:20:00.000Z"
+        val tInc = "2026-11-12T11:00:00.000Z"
         val labels = listOf(
-            LabelRecord("lbl-dr", "#Dr.", "Clinic consultations & pharmacy bills", "#2563EB", 2000.0, t1, t1, listOf(AuditEntry(action = "Created", at = t1, summary = "Seeded label"))),
-            LabelRecord("lbl-school", "#School", "Tuition, craft supplies & fees", "#7C3AED", 1200.0, t1, t1, listOf(AuditEntry(action = "Created", at = t1, summary = "Seeded label"))),
-            LabelRecord("lbl-vegetables", "#Vegetables", "Daily fresh market produce", "#059669", 800.0, t1, t1, listOf(AuditEntry(action = "Created", at = t1, summary = "Seeded label")))
+            LabelRecord("lbl-dr", "#Dr.", "Clinic consultations, lab diagnostics & pharmacy bills", "#2563EB", 2000.0, t1, t1, listOf(AuditEntry(action = "Created", at = t1, summary = "Label initialized"))),
+            LabelRecord("lbl-school", "#School", "Tuition, stationery, workshop wood & exam fees", "#7C3AED", 1200.0, t1Sch, "2026-11-12T14:20:00.000Z", listOf(AuditEntry(action = "Created", at = t1Sch, summary = "Label initialized"))),
+            LabelRecord("lbl-vegetables", "#Vegetables", "Daily fresh produce, herbs & kitchen market runs", "#059669", 800.0, t1Veg, t1Veg, listOf(AuditEntry(action = "Created", at = t1Veg, summary = "Label initialized")))
         )
         val lists = listOf(
-            ListNoteRecord("list-craft", "School Craft & Fees Breakdown", "Wood -> ₹5\nFees -> ₹10\nOthers -> ₹15", t2, t2, listOf(AuditEntry(action = "Created", at = t2, summary = "Created breakdown ₹30")))
+            ListNoteRecord("list-craft-supplies", "School Craft & Fees Breakdown", "Wood -> ₹5\nFees -> ₹10\nOthers -> ₹15", t2, t2, listOf(AuditEntry(action = "Created", at = t2, summary = "Created itemized breakdown (₹30)"))),
+            ListNoteRecord("list-veg-basket", "Morning Produce Basket", "Tomatoes -> ₹60\nSpinach -> ₹40\nCoriander -> ₹20", "2026-11-15T07:10:00.000Z", "2026-11-15T07:10:00.000Z", listOf(AuditEntry(action = "Created", at = "2026-11-15T07:10:00.000Z", summary = "Created morning market checklist (₹120)")))
         )
         val expenses = listOf(
-            ExpenseRecord("exp-1", 850.0, "Pediatric checkup & vitamin prescription", ExpenseStatus.PAID, listOf("lbl-dr", "lbl-school"), emptyList(), null, null, t2, t2, listOf(AuditEntry(action = "Created", at = t2, summary = "Logged ₹850")), EntryType.EXPENSE, PaymentMode.UPI, false, null),
-            ExpenseRecord("exp-2", 30.0, "Term project wood, fees & misc supplies", ExpenseStatus.HOLD, listOf("lbl-school"), listOf("list-craft"), "calc-1", "5 + 10 + 15 = 30", t2, t2, listOf(AuditEntry(action = "Created", at = t2, summary = "Logged ₹30 with attached list")), EntryType.EXPENSE, PaymentMode.CASH, false, null),
-            ExpenseRecord("exp-3", 450.0, "Lab blood panel follow-up deposit", ExpenseStatus.NEED, listOf("lbl-dr"), emptyList(), null, null, t2, t2, listOf(AuditEntry(action = "Created", at = t2, summary = "Logged ₹450")), EntryType.EXPENSE, PaymentMode.CARD, true, "2026-11-18"),
-            ExpenseRecord("exp-inc-1", 5000.0, "Freelance UI consultation payout", ExpenseStatus.PAID, emptyList(), emptyList(), null, null, t2, t2, listOf(AuditEntry(action = "Created", at = t2, summary = "Logged ₹5000 income")), EntryType.INCOME, PaymentMode.BANK, false, null)
+            ExpenseRecord("exp-1", 850.0, "Pediatric checkup & vitamin prescription", ExpenseStatus.PAID, listOf("lbl-dr", "lbl-school"), emptyList(), null, null, "2026-11-13T10:15:00.000Z", "2026-11-13T17:40:00.000Z", listOf(AuditEntry(action = "Created", at = "2026-11-13T10:15:00.000Z", summary = "Logged ₹850 as Need"), AuditEntry(action = "Updated", at = "2026-11-13T17:40:00.000Z", summary = "Status changed from Need to Paid")), EntryType.EXPENSE, PaymentMode.UPI, false, null, 850.0),
+            ExpenseRecord("exp-2", 30.0, "Term project wood, fees & misc supplies", ExpenseStatus.HOLD, listOf("lbl-school"), listOf("list-craft-supplies"), "calc-seed-1", "5 + 10 + 15 = 30", "2026-11-14T08:45:00.000Z", "2026-11-14T08:45:00.000Z", listOf(AuditEntry(action = "Created", at = "2026-11-14T08:45:00.000Z", summary = "Logged ₹30 with attached list breakdown")), EntryType.EXPENSE, PaymentMode.CASH, false, null, 0.0),
+            ExpenseRecord("exp-3", 120.0, "Weekly green market produce basket", ExpenseStatus.PAID, listOf("lbl-vegetables"), listOf("list-veg-basket"), "calc-seed-2", "60 + 40 + 20 = 120", t3, t3, listOf(AuditEntry(action = "Created", at = t3, summary = "Logged ₹120 as Paid")), EntryType.EXPENSE, PaymentMode.UPI, false, null, 120.0, splitShares = listOf(ExpenseSplitShare("spl-veg-1", "Meera", 60.0))),
+            ExpenseRecord("exp-4", 450.0, "Lab blood panel follow-up deposit", ExpenseStatus.NEED, listOf("lbl-dr"), emptyList(), null, null, t4, t4, listOf(AuditEntry(action = "Created", at = t4, summary = "Logged ₹450 as Need (Pinned due bill)")), EntryType.EXPENSE, PaymentMode.CARD, true, "2026-11-18", 0.0),
+            ExpenseRecord("exp-inc-1", 5000.0, "Freelance UI consultation payout", ExpenseStatus.PAID, emptyList(), emptyList(), null, null, tInc, tInc, listOf(AuditEntry(action = "Created", at = tInc, summary = "Logged ₹5,000 Income via Bank")), EntryType.INCOME, PaymentMode.BANK, false, null, 5000.0)
         )
         val calcHistory = listOf(
-            CalcHistoryRecord("calc-1", "5 + 10 + 15", 30.0, t2, t2)
+            CalcHistoryRecord("calc-seed-1", "5 + 10 + 15", 30.0, "2026-11-14T08:42:00.000Z", "2026-11-14T08:42:00.000Z"),
+            CalcHistoryRecord("calc-seed-2", "60 + 40 + 20", 120.0, "2026-11-15T07:32:00.000Z", "2026-11-15T07:33:15.000Z")
         )
         val templates = listOf(
-            ExpenseTemplateRecord("tpl-veg", "Weekly Produce Basket", 120.0, ExpenseStatus.PAID, listOf("lbl-vegetables"), emptyList(), RecurrenceCycle.WEEKLY, null, t1, EntryType.EXPENSE, PaymentMode.CASH),
-            ExpenseTemplateRecord("tpl-clinic", "Monthly Clinic Checkup", 500.0, ExpenseStatus.NEED, listOf("lbl-dr"), emptyList(), RecurrenceCycle.MONTHLY, null, t1, EntryType.EXPENSE, PaymentMode.UPI)
+            ExpenseTemplateRecord("tpl-veg-run", "Weekly Produce Basket", 120.0, ExpenseStatus.PAID, listOf("lbl-vegetables"), listOf("list-veg-basket"), RecurrenceCycle.WEEKLY, null, "2026-11-10T09:30:00.000Z", EntryType.EXPENSE, PaymentMode.UPI),
+            ExpenseTemplateRecord("tpl-clinic-visit", "Monthly Clinic Checkup", 500.0, ExpenseStatus.NEED, listOf("lbl-dr"), emptyList(), RecurrenceCycle.MONTHLY, null, "2026-11-10T09:32:00.000Z", EntryType.EXPENSE, PaymentMode.CARD)
         )
         val startBalances = mapOf(PaymentMode.UPI to 4000.0, PaymentMode.CASH to 1500.0, PaymentMode.CARD to 0.0, PaymentMode.BANK to 12000.0)
-        val seedTransfers = listOf(WalletTransferRecord("trf-seed-1", PaymentMode.BANK, PaymentMode.UPI, 2000.0, "Weekly UPI wallet top-up", t2))
+        val seedTransfers = listOf(WalletTransferRecord("trf-seed-1", PaymentMode.BANK, PaymentMode.UPI, 1000.0, "Weekly UPI wallet top-up", "2026-11-12T12:00:00.000Z"))
         val seedRules = listOf(
-            AutoLabelRule("rule-clinic", "clinic", listOf("lbl-dr"), PaymentMode.UPI, true),
-            AutoLabelRule("rule-school", "school", listOf("lbl-school"), PaymentMode.CASH, true),
-            AutoLabelRule("rule-veg", "produce", listOf("lbl-vegetables"), PaymentMode.CASH, true)
+            AutoLabelRule("rule-seed-clinic", "clinic", listOf("lbl-dr"), PaymentMode.UPI, true),
+            AutoLabelRule("rule-seed-pharmacy", "pharmacy", listOf("lbl-dr"), null, true),
+            AutoLabelRule("rule-seed-produce", "market", listOf("lbl-vegetables"), PaymentMode.UPI, true)
         )
         val seedGoals = listOf(
-            SavingsGoalItem("goal-emergency", "Emergency Clinic Reserve", 5000.0, "2026-12-31", 1000.0, "#059669", t1)
+            SavingsGoalItem("goal-seed-emergency", "Medical & Family Sinking Fund", 10000.0, "2026-12-20", 1000.0, "#059669", "2026-11-10T09:00:00.000Z")
         )
         val seedGoalTxs = listOf(
-            GoalTransaction("gtx-1", "goal-emergency", "deposit", 1500.0, PaymentMode.BANK, t2, "Initial sinking fund")
+            GoalTransaction("gtxn-seed-1", "goal-seed-emergency", "deposit", 2500.0, PaymentMode.BANK, "2026-11-12T12:30:00.000Z", "Initial sinking fund deposit")
         )
         return LedgerSnapshot(
             expenses = expenses,
