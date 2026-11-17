@@ -6,6 +6,7 @@ import android.database.sqlite.SQLiteDatabase
 import android.database.sqlite.SQLiteOpenHelper
 import org.json.JSONArray
 import org.json.JSONObject
+import java.security.MessageDigest
 import java.text.SimpleDateFormat
 import java.util.Calendar
 import java.util.Date
@@ -27,6 +28,28 @@ enum class ExpenseStatus(val label: String) {
     companion object {
         fun fromString(value: String): ExpenseStatus =
             entries.firstOrNull { it.label.equals(value, ignoreCase = true) } ?: NEED
+    }
+}
+
+enum class EntryType(val label: String) {
+    EXPENSE("Expense"),
+    INCOME("Income");
+
+    companion object {
+        fun fromString(value: String): EntryType =
+            entries.firstOrNull { it.label.equals(value, ignoreCase = true) } ?: EXPENSE
+    }
+}
+
+enum class PaymentMode(val label: String) {
+    UPI("UPI"),
+    CASH("Cash"),
+    CARD("Card"),
+    BANK("Bank");
+
+    companion object {
+        fun fromString(value: String): PaymentMode =
+            entries.firstOrNull { it.label.equals(value, ignoreCase = true) } ?: UPI
     }
 }
 
@@ -91,7 +114,11 @@ data class ExpenseRecord(
     val calcFormula: String? = null,
     val createdAt: String,
     val updatedAt: String = createdAt,
-    val auditLog: List<AuditEntry>
+    val auditLog: List<AuditEntry>,
+    val entryType: EntryType = EntryType.EXPENSE,
+    val paymentMode: PaymentMode = PaymentMode.UPI,
+    val isPinned: Boolean = false,
+    val dueDate: String? = null
 )
 
 data class CalcHistoryRecord(
@@ -111,7 +138,9 @@ data class ExpenseTemplateRecord(
     val attachedListIds: List<String> = emptyList(),
     val recurrence: RecurrenceCycle = RecurrenceCycle.NONE,
     val lastUsedAt: String? = null,
-    val createdAt: String
+    val createdAt: String,
+    val entryType: EntryType = EntryType.EXPENSE,
+    val paymentMode: PaymentMode = PaymentMode.UPI
 )
 
 data class BinnedRecord(
@@ -131,7 +160,9 @@ data class LedgerSnapshot(
     val calculatorHistory: List<CalcHistoryRecord>,
     val templates: List<ExpenseTemplateRecord> = emptyList(),
     val bin: List<BinnedRecord> = emptyList(),
-    val binRetentionDays: Int? = 30
+    val binRetentionDays: Int? = 30,
+    val privacyPinHash: String? = null,
+    val hideBalances: Boolean = false
 )
 
 data class CalendarDayCell(
@@ -139,6 +170,47 @@ data class CalendarDayCell(
     val day: Int,
     val total: Double,
     val expenses: List<ExpenseRecord>
+)
+
+data class CashflowSummary(
+    val totalIncome: Double,
+    val paidExpenses: Double,
+    val unpaidObligations: Double,
+    val netCashflow: Double,
+    val incomeCount: Int,
+    val expenseCount: Int
+)
+
+data class WalletSummary(
+    val mode: PaymentMode,
+    val expenseTotal: Double,
+    val incomeTotal: Double,
+    val netFlow: Double,
+    val count: Int,
+    val sharePct: Int
+)
+
+data class MerchantSummary(
+    val displayName: String,
+    val count: Int,
+    val totalSpent: Double,
+    val avgSpent: Double,
+    val primaryMode: PaymentMode
+)
+
+data class ParsedSmsResult(
+    val matched: Boolean,
+    val amount: Double?,
+    val entryType: EntryType,
+    val paymentMode: PaymentMode,
+    val quote: String
+)
+
+data class CsvImportResult(
+    val validEntries: List<ExpenseRecord>,
+    val newLabels: List<LabelRecord>,
+    val skippedRows: Int,
+    val errors: List<String>
 )
 
 object LedgerMath {
@@ -206,6 +278,21 @@ object LedgerMath {
         }
     }
 
+    fun formatDisplayAmt(value: Double, hideBalances: Boolean): String {
+        return if (hideBalances) "••••" else formatAmt(value)
+    }
+
+    fun sha256Pin(pin: String): String {
+        val digest = MessageDigest.getInstance("SHA-256")
+        val bytes = digest.digest(("elpin-v1:" + pin.trim()).toByteArray(Charsets.UTF_8))
+        return bytes.joinToString("") { "%02x".format(it) }
+    }
+
+    fun verifyPin(pin: String, expectedHash: String?): Boolean {
+        if (expectedHash.isNullOrBlank()) return true
+        return sha256Pin(pin) == expectedHash.lowercase(Locale.US)
+    }
+
     fun availableMonths(expenses: List<ExpenseRecord>): List<String> {
         val monthRegex = Regex("""^\d{4}-\d{2}$""")
         return expenses
@@ -239,7 +326,7 @@ object LedgerMath {
         val daysInMonth = cal.getActualMaximum(Calendar.DAY_OF_MONTH)
         val dow = cal.get(Calendar.DAY_OF_WEEK) // Sun=1 .. Sat=7
         val firstWeekdayMon0 = (dow + 5) % 7
-        val monthExpenses = expenses.filter { it.createdAt.startsWith(monthKey) }
+        val monthExpenses = expenses.filter { it.entryType == EntryType.EXPENSE && it.createdAt.startsWith(monthKey) }
         val byDate = monthExpenses.groupBy { it.createdAt.take(10) }
         val cells = (1..daysInMonth).map { day ->
             val dateKey = String.format(Locale.US, "%s-%02d", monthKey, day)
@@ -247,6 +334,114 @@ object LedgerMath {
             CalendarDayCell(dateKey = dateKey, day = day, total = list.sumOf { it.balance }, expenses = list)
         }
         return firstWeekdayMon0 to cells
+    }
+
+    fun computeCashflowSummary(expenses: List<ExpenseRecord>, monthKey: String? = null): CashflowSummary {
+        val scope = if (monthKey.isNullOrBlank()) expenses else expenses.filter { it.createdAt.startsWith(monthKey) }
+        val incomeItems = scope.filter { it.entryType == EntryType.INCOME }
+        val expItems = scope.filter { it.entryType == EntryType.EXPENSE }
+        val totalIncome = incomeItems.sumOf { it.balance }
+        val paidExp = expItems.filter { it.status == ExpenseStatus.PAID }.sumOf { it.balance }
+        val unpaid = expItems.filter { it.status != ExpenseStatus.PAID }.sumOf { it.balance }
+        return CashflowSummary(
+            totalIncome = totalIncome,
+            paidExpenses = paidExp,
+            unpaidObligations = unpaid,
+            netCashflow = totalIncome - paidExp,
+            incomeCount = incomeItems.size,
+            expenseCount = expItems.size
+        )
+    }
+
+    fun computeWalletBreakdown(expenses: List<ExpenseRecord>, monthKey: String? = null): List<WalletSummary> {
+        val scope = if (monthKey.isNullOrBlank()) expenses else expenses.filter { it.createdAt.startsWith(monthKey) }
+        val grandExp = scope.filter { it.entryType == EntryType.EXPENSE }.sumOf { it.balance }
+        return PaymentMode.entries.map { mode ->
+            val rows = scope.filter { it.paymentMode == mode }
+            val expAmt = rows.filter { it.entryType == EntryType.EXPENSE }.sumOf { it.balance }
+            val incAmt = rows.filter { it.entryType == EntryType.INCOME }.sumOf { it.balance }
+            val pct = if (grandExp > 0.0) kotlin.math.round((expAmt / grandExp) * 100.0).toInt() else 0
+            WalletSummary(mode, expAmt, incAmt, incAmt - expAmt, rows.size, pct)
+        }
+    }
+
+    fun computeMerchantInsights(expenses: List<ExpenseRecord>, monthKey: String? = null): List<MerchantSummary> {
+        val scope = (if (monthKey.isNullOrBlank()) expenses else expenses.filter { it.createdAt.startsWith(monthKey) })
+            .filter { it.entryType == EntryType.EXPENSE }
+        val grouped = scope.groupBy {
+            it.quote.trim().lowercase(Locale.US).replace(Regex("""\s*\(copy\)\s*$"""), "").ifBlank { "untitled" }
+        }
+        return grouped.values.map { list ->
+            val total = list.sumOf { it.balance }
+            val topMode = list.groupingBy { it.paymentMode }.eachCount().maxByOrNull { it.value }?.key ?: PaymentMode.UPI
+            val title = list.first().quote.replace(Regex("""\s*\(copy\)\s*$""", RegexOption.IGNORE_CASE), "").trim().ifBlank { "Untitled" }
+            MerchantSummary(
+                displayName = title,
+                count = list.size,
+                totalSpent = total,
+                avgSpent = total / list.size.coerceAtLeast(1),
+                primaryMode = topMode
+            )
+        }.sortedWith(compareByDescending<MerchantSummary> { it.count }.thenByDescending { it.totalSpent })
+    }
+
+    fun computeDueLabel(dueDate: String?, status: ExpenseStatus, entryType: EntryType): String? {
+        if (entryType == EntryType.INCOME || dueDate.isNullOrBlank()) return null
+        if (!Regex("""^\d{4}-\d{2}-\d{2}$""").matches(dueDate.trim())) return null
+        if (status == ExpenseStatus.PAID) return "Due $dueDate · Settled"
+        return try {
+            val fmt = SimpleDateFormat("yyyy-MM-dd", Locale.US)
+            fmt.timeZone = TimeZone.getTimeZone("UTC")
+            val dueMs = fmt.parse(dueDate.trim())?.time ?: return null
+            val todayStr = fmt.format(Date())
+            val todayMs = fmt.parse(todayStr)?.time ?: return null
+            val diff = ((dueMs - todayMs) / MS_PER_DAY).toInt()
+            when {
+                diff < 0 -> "Overdue ${kotlin.math.abs(diff)}d"
+                diff == 0 -> "Due Today"
+                diff == 1 -> "Due Tomorrow"
+                else -> "Due in ${diff}d"
+            }
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    fun parseBankSmsSnippet(rawText: String): ParsedSmsResult {
+        val text = rawText.trim()
+        if (text.isBlank()) {
+            return ParsedSmsResult(false, null, EntryType.EXPENSE, PaymentMode.UPI, "")
+        }
+        val amtRegex = Regex("""(?:₹|rs\.?|inr)\s*(\d{1,3}(?:,\d{2,3})*(?:\.\d{1,2})?|\d+(?:\.\d{1,2})?)""", RegexOption.IGNORE_CASE)
+        val fallbackRegex = Regex("""(?:debited|credited|paid|sent|spent|received)\s*(?:by|for|with)?\s*(?:₹|rs\.?|inr)?\s*(\d{1,3}(?:,\d{2,3})*(?:\.\d{1,2})?|\d+(?:\.\d{1,2})?)""", RegexOption.IGNORE_CASE)
+        val amtMatch = amtRegex.find(text) ?: fallbackRegex.find(text)
+        val amount = amtMatch?.groupValues?.getOrNull(1)?.replace(",", "")?.toDoubleOrNull()
+
+        val hasCredit = Regex("""\b(credited|received|deposited|refunded|cashback|salary)\b""", RegexOption.IGNORE_CASE).containsMatchIn(text)
+        val hasDebit = Regex("""\b(debited|spent|paid|withdrawn|sent to)\b""", RegexOption.IGNORE_CASE).containsMatchIn(text)
+        val entryType = if (hasCredit && !hasDebit) EntryType.INCOME else EntryType.EXPENSE
+
+        val mode = when {
+            Regex("""\b(upi|vpa|gpay|google pay|phonepe|paytm|bhim|@ok|@ybl|@ibl|@axl)\b""", RegexOption.IGNORE_CASE).containsMatchIn(text) -> PaymentMode.UPI
+            Regex("""\b(credit card|debit card|card xx|visa|mastercard|rupay|pos)\b""", RegexOption.IGNORE_CASE).containsMatchIn(text) -> PaymentMode.CARD
+            Regex("""\b(neft|imps|rtgs|netbanking|net banking|a/c|acct|account)\b""", RegexOption.IGNORE_CASE).containsMatchIn(text) -> PaymentMode.BANK
+            Regex("""\b(cash|atm)\b""", RegexOption.IGNORE_CASE).containsMatchIn(text) -> PaymentMode.CASH
+            else -> PaymentMode.UPI
+        }
+
+        val merchantPat = Regex("""(?:\bto\b|\bat\b|\btowards\b|\bpaid to\b)\s+([A-Za-z0-9&._\- ]{2,36}?)(?=\s+(?:via|on|ref|utr|upi|using|from|avl|bal)\b|[.,;]|$)""", RegexOption.IGNORE_CASE)
+        val fromPat = Regex("""(?:\bfrom\b|\bby\b)\s+([A-Za-z0-9&._\- ]{2,36}?)(?=\s+(?:via|on|ref|utr|upi|to|avl|bal)\b|[.,;]|$)""", RegexOption.IGNORE_CASE)
+        val extractedQuote = (merchantPat.find(text)?.groupValues?.getOrNull(1)
+            ?: fromPat.find(text)?.groupValues?.getOrNull(1)
+            ?: text.replace(amtRegex, "").replace(Regex("""\s+"""), " ").take(36)).trim()
+
+        return ParsedSmsResult(
+            matched = amount != null && amount > 0.0,
+            amount = amount,
+            entryType = entryType,
+            paymentMode = mode,
+            quote = extractedQuote
+        )
     }
 
     fun isTemplateDue(tpl: ExpenseTemplateRecord, nowMs: Long = System.currentTimeMillis()): Boolean {
@@ -294,9 +489,10 @@ object LedgerMath {
     ): String {
         val targetLabel = labelId?.let { id -> snapshot.labels.firstOrNull { it.id == id } }
         val filtered = snapshot.expenses.filter { exp ->
+            val matchExpense = exp.entryType == EntryType.EXPENSE
             val matchLabel = targetLabel == null || exp.labelIds.contains(targetLabel.id)
             val matchMonth = monthKey.isNullOrBlank() || exp.createdAt.startsWith(monthKey)
-            matchLabel && matchMonth
+            matchExpense && matchLabel && matchMonth
         }
         val paid = filtered.filter { it.status == ExpenseStatus.PAID }.sumOf { it.balance }
         val hold = filtered.filter { it.status == ExpenseStatus.HOLD }.sumOf { it.balance }
@@ -317,7 +513,7 @@ object LedgerMath {
                 filtered.forEachIndexed { idx, exp ->
                     val tagNames = exp.labelIds.mapNotNull { id -> snapshot.labels.firstOrNull { it.id == id }?.name }
                     val tagSuffix = if (tagNames.isNotEmpty()) " [" + tagNames.joinToString(", ") + "]" else ""
-                    appendLine("${idx + 1}. [${exp.status.label.uppercase()}] ₹${formatAmt(exp.balance)} — ${exp.quote}$tagSuffix")
+                    appendLine("${idx + 1}. [${exp.status.label.uppercase()} · ${exp.paymentMode.label}] ₹${formatAmt(exp.balance)} — ${exp.quote}$tagSuffix")
                 }
             }
         }.trimEnd()
@@ -332,7 +528,11 @@ object LedgerMath {
     }
 
     fun generateCsv(snapshot: LedgerSnapshot): String {
-        val header = listOf("ID", "Created", "Updated", "Balance (INR)", "Status", "Quote", "Labels", "Attached Lists", "Math Tape")
+        val header = listOf(
+            "ID", "Created", "Updated", "Balance (INR)", "Status",
+            "Entry Type", "Payment Mode", "Pinned", "Due Date",
+            "Quote", "Labels", "Attached Lists", "Math Tape"
+        )
         return buildString {
             append(header.joinToString(",") { escapeCsv(it) })
             snapshot.expenses.forEach { exp ->
@@ -345,6 +545,10 @@ object LedgerMath {
                     exp.updatedAt,
                     formatAmt(exp.balance),
                     exp.status.label,
+                    exp.entryType.label,
+                    exp.paymentMode.label,
+                    if (exp.isPinned) "Yes" else "No",
+                    exp.dueDate ?: "",
                     exp.quote,
                     lblNames,
                     lstNames,
@@ -353,6 +557,146 @@ object LedgerMath {
                 append(cols.joinToString(",") { escapeCsv(it) })
             }
         }
+    }
+
+    private fun parseCsvRows(csvText: String): List<List<String>> {
+        val clean = csvText.trimStart('\uFEFF')
+        val rows = mutableListOf<List<String>>()
+        val currentRow = mutableListOf<String>()
+        val cell = StringBuilder()
+        var inQuotes = false
+        var i = 0
+        while (i < clean.length) {
+            val ch = clean[i]
+            if (inQuotes) {
+                if (ch == '\"') {
+                    if (i + 1 < clean.length && clean[i + 1] == '\"') {
+                        cell.append('\"')
+                        i++
+                    } else {
+                        inQuotes = false
+                    }
+                } else {
+                    cell.append(ch)
+                }
+            } else {
+                when (ch) {
+                    '\"' -> inQuotes = true
+                    ',' -> {
+                        currentRow.add(cell.toString())
+                        cell.clear()
+                    }
+                    '\r' -> {
+                        if (i + 1 < clean.length && clean[i + 1] == '\n') i++
+                        currentRow.add(cell.toString())
+                        cell.clear()
+                        if (currentRow.any { it.isNotBlank() }) rows.add(currentRow.toList())
+                        currentRow.clear()
+                    }
+                    '\n' -> {
+                        currentRow.add(cell.toString())
+                        cell.clear()
+                        if (currentRow.any { it.isNotBlank() }) rows.add(currentRow.toList())
+                        currentRow.clear()
+                    }
+                    else -> cell.append(ch)
+                }
+            }
+            i++
+        }
+        if (cell.isNotEmpty() || currentRow.isNotEmpty()) {
+            currentRow.add(cell.toString())
+            if (currentRow.any { it.isNotBlank() }) rows.add(currentRow.toList())
+        }
+        return rows
+    }
+
+    fun parseCsvImport(csvText: String, existingLabels: List<LabelRecord>): CsvImportResult {
+        val rows = parseCsvRows(csvText)
+        if (rows.size < 2) {
+            return CsvImportResult(emptyList(), emptyList(), 0, listOf("CSV needs header and at least 1 row."))
+        }
+        val headers = rows.first().map { it.trim().lowercase(Locale.US) }
+        fun findCol(keys: List<String>): Int = headers.indexOfFirst { h -> keys.any { k -> h == k || h.contains(k) } }
+        val colBal = findCol(listOf("balance", "amount", "value", "inr", "total"))
+        if (colBal < 0) {
+            return CsvImportResult(emptyList(), emptyList(), rows.size - 1, listOf("Missing Balance/Amount column."))
+        }
+        val colQuote = findCol(listOf("quote", "description", "title", "merchant", "note"))
+        val colStatus = findCol(listOf("status", "state"))
+        val colType = findCol(listOf("entry type", "type", "kind"))
+        val colMode = findCol(listOf("payment mode", "mode", "wallet", "account"))
+        val colPin = findCol(listOf("pinned", "pin"))
+        val colDue = findCol(listOf("due date", "due"))
+        val colLabels = findCol(listOf("labels", "category", "tags"))
+
+        val labelMap = existingLabels.associateBy { it.name.lowercase(Locale.US) }.toMutableMap()
+        val newLabels = mutableListOf<LabelRecord>()
+        val validEntries = mutableListOf<ExpenseRecord>()
+        val errors = mutableListOf<String>()
+        var skipped = 0
+        val now = nowIso()
+        val palette = listOf("#2563EB", "#059669", "#D97706", "#7C3AED", "#DC2626", "#0D9488")
+
+        for (r in 1 until rows.size) {
+            val cols = rows[r]
+            val rawAmt = cols.getOrNull(colBal).orEmpty().replace(Regex("""[₹,\s]"""), "")
+            val amt = rawAmt.toDoubleOrNull()
+            if (amt == null || amt <= 0.0) {
+                skipped++
+                errors.add("Row ${r + 1}: invalid amount")
+                continue
+            }
+            val quote = cols.getOrNull(colQuote)?.trim().orEmpty().ifBlank { "Imported Row $r" }
+            val entryType = EntryType.fromString(cols.getOrNull(colType).orEmpty())
+            val status = if (entryType == EntryType.INCOME) ExpenseStatus.PAID else ExpenseStatus.fromString(cols.getOrNull(colStatus).orEmpty())
+            val mode = PaymentMode.fromString(cols.getOrNull(colMode).orEmpty())
+            val pinRaw = cols.getOrNull(colPin).orEmpty().trim().lowercase(Locale.US)
+            val isPinned = pinRaw == "yes" || pinRaw == "true" || pinRaw == "1"
+            val dueRaw = cols.getOrNull(colDue)?.trim().orEmpty()
+            val dueDate = if (Regex("""^\d{4}-\d{2}-\d{2}$""").matches(dueRaw)) dueRaw else null
+
+            val rowLblIds = mutableListOf<String>()
+            val rawLblStr = cols.getOrNull(colLabels).orEmpty()
+            if (rawLblStr.isNotBlank()) {
+                rawLblStr.split("|", ";", ",").map { it.trim() }.filter { it.isNotBlank() }.forEach { tok ->
+                    val norm = if (tok.startsWith("#")) tok else "#$tok"
+                    val key = norm.lowercase(Locale.US)
+                    var lbl = labelMap[key]
+                    if (lbl == null) {
+                        val color = palette[(existingLabels.size + newLabels.size) % palette.size]
+                        lbl = LabelRecord(
+                            name = norm,
+                            description = "Created from CSV import",
+                            colorHex = color,
+                            createdAt = now,
+                            updatedAt = now,
+                            auditLog = listOf(AuditEntry(action = "Created", at = now, summary = "CSV import label $norm"))
+                        )
+                        labelMap[key] = lbl
+                        newLabels.add(lbl)
+                    }
+                    if (!rowLblIds.contains(lbl.id)) rowLblIds.add(lbl.id)
+                }
+            }
+
+            validEntries.add(
+                ExpenseRecord(
+                    balance = amt,
+                    quote = quote,
+                    status = status,
+                    labelIds = rowLblIds,
+                    createdAt = now,
+                    updatedAt = now,
+                    auditLog = listOf(AuditEntry(action = "Created", at = now, summary = "Imported CSV ₹${formatAmt(amt)} (${mode.label})")),
+                    entryType = entryType,
+                    paymentMode = mode,
+                    isPinned = isPinned,
+                    dueDate = dueDate
+                )
+            )
+        }
+        return CsvImportResult(validEntries, newLabels, skipped, errors)
     }
 }
 
@@ -470,6 +814,10 @@ class LedgerDbHelper(context: Context) : SQLiteOpenHelper(context, "expense_ledg
         put("balance", e.balance)
         put("quote", e.quote)
         put("status", e.status.label)
+        put("entryType", e.entryType.label)
+        put("paymentMode", e.paymentMode.label)
+        put("isPinned", e.isPinned)
+        put("dueDate", e.dueDate ?: JSONObject.NULL)
         put("labelIds", JSONArray(e.labelIds))
         put("attachedListIds", JSONArray(e.attachedListIds))
         put("calcHistoryId", e.calcHistoryId ?: JSONObject.NULL)
@@ -484,6 +832,8 @@ class LedgerDbHelper(context: Context) : SQLiteOpenHelper(context, "expense_ledg
         put("title", t.title)
         put("balance", t.balance)
         put("defaultStatus", t.defaultStatus.label)
+        put("entryType", t.entryType.label)
+        put("paymentMode", t.paymentMode.label)
         put("labelIds", JSONArray(t.labelIds))
         put("attachedListIds", JSONArray(t.attachedListIds))
         put("recurrence", t.recurrence.label)
@@ -528,6 +878,8 @@ class LedgerDbHelper(context: Context) : SQLiteOpenHelper(context, "expense_ledg
         root.put("templates", tplArr)
         root.put("bin", binArr)
         root.put("binRetentionDays", snapshot.binRetentionDays ?: JSONObject.NULL)
+        root.put("privacyPinHash", snapshot.privacyPinHash ?: JSONObject.NULL)
+        root.put("hideBalances", snapshot.hideBalances)
         return root.toString()
     }
 
@@ -581,6 +933,7 @@ class LedgerDbHelper(context: Context) : SQLiteOpenHelper(context, "expense_ledg
 
         val calcHistoryId = if (o.isNull("calcHistoryId")) null else o.optString("calcHistoryId").takeIf { it.isNotBlank() }
         val calcFormula = if (o.isNull("calcFormula")) null else o.optString("calcFormula").takeIf { it.isNotBlank() }
+        val dueDate = if (o.isNull("dueDate")) null else o.optString("dueDate").takeIf { it.isNotBlank() }
         val createdAt = o.optString("createdAt")
         val audit = decodeAuditList(o.optJSONArray("auditLog"))
         val updatedAt = o.optString("updatedAt").ifBlank { audit.lastOrNull()?.at ?: createdAt }
@@ -596,7 +949,11 @@ class LedgerDbHelper(context: Context) : SQLiteOpenHelper(context, "expense_ledg
             calcFormula = calcFormula,
             createdAt = createdAt,
             updatedAt = updatedAt,
-            auditLog = audit
+            auditLog = audit,
+            entryType = EntryType.fromString(o.optString("entryType", "Expense")),
+            paymentMode = PaymentMode.fromString(o.optString("paymentMode", "UPI")),
+            isPinned = o.optBoolean("isPinned", false),
+            dueDate = dueDate
         )
     }
 
@@ -617,7 +974,9 @@ class LedgerDbHelper(context: Context) : SQLiteOpenHelper(context, "expense_ledg
             attachedListIds = attIds,
             recurrence = RecurrenceCycle.fromString(o.optString("recurrence", "None")),
             lastUsedAt = lastUsed,
-            createdAt = o.optString("createdAt")
+            createdAt = o.optString("createdAt"),
+            entryType = EntryType.fromString(o.optString("entryType", "Expense")),
+            paymentMode = PaymentMode.fromString(o.optString("paymentMode", "UPI"))
         )
     }
 
@@ -695,7 +1054,10 @@ class LedgerDbHelper(context: Context) : SQLiteOpenHelper(context, "expense_ledg
                 )
             }
 
-            LedgerSnapshot(expenses, labels, lists, calcHistory, templates, LedgerMath.pruneExpiredBin(bin, retention), retention)
+            val pinHash = if (root.isNull("privacyPinHash")) null else root.optString("privacyPinHash").takeIf { it.isNotBlank() }
+            val hideBalances = root.optBoolean("hideBalances", false)
+
+            LedgerSnapshot(expenses, labels, lists, calcHistory, templates, LedgerMath.pruneExpiredBin(bin, retention), retention, pinHash, hideBalances)
         } catch (_: Exception) {
             createSeedSnapshot()
         }
@@ -881,17 +1243,18 @@ class LedgerDbHelper(context: Context) : SQLiteOpenHelper(context, "expense_ledg
             ListNoteRecord("list-craft", "School Craft & Fees Breakdown", "Wood -> ₹5\nFees -> ₹10\nOthers -> ₹15", t2, t2, listOf(AuditEntry(action = "Created", at = t2, summary = "Created breakdown ₹30")))
         )
         val expenses = listOf(
-            ExpenseRecord("exp-1", 850.0, "Pediatric checkup & vitamin prescription", ExpenseStatus.PAID, listOf("lbl-dr", "lbl-school"), emptyList(), null, null, t2, t2, listOf(AuditEntry(action = "Created", at = t2, summary = "Logged ₹850"))),
-            ExpenseRecord("exp-2", 30.0, "Term project wood, fees & misc supplies", ExpenseStatus.HOLD, listOf("lbl-school"), listOf("list-craft"), "calc-1", "5 + 10 + 15 = 30", t2, t2, listOf(AuditEntry(action = "Created", at = t2, summary = "Logged ₹30 with attached list"))),
-            ExpenseRecord("exp-3", 450.0, "Lab blood panel follow-up deposit", ExpenseStatus.NEED, listOf("lbl-dr"), emptyList(), null, null, t2, t2, listOf(AuditEntry(action = "Created", at = t2, summary = "Logged ₹450")))
+            ExpenseRecord("exp-1", 850.0, "Pediatric checkup & vitamin prescription", ExpenseStatus.PAID, listOf("lbl-dr", "lbl-school"), emptyList(), null, null, t2, t2, listOf(AuditEntry(action = "Created", at = t2, summary = "Logged ₹850")), EntryType.EXPENSE, PaymentMode.UPI, false, null),
+            ExpenseRecord("exp-2", 30.0, "Term project wood, fees & misc supplies", ExpenseStatus.HOLD, listOf("lbl-school"), listOf("list-craft"), "calc-1", "5 + 10 + 15 = 30", t2, t2, listOf(AuditEntry(action = "Created", at = t2, summary = "Logged ₹30 with attached list")), EntryType.EXPENSE, PaymentMode.CASH, false, null),
+            ExpenseRecord("exp-3", 450.0, "Lab blood panel follow-up deposit", ExpenseStatus.NEED, listOf("lbl-dr"), emptyList(), null, null, t2, t2, listOf(AuditEntry(action = "Created", at = t2, summary = "Logged ₹450")), EntryType.EXPENSE, PaymentMode.CARD, true, "2026-11-18"),
+            ExpenseRecord("exp-inc-1", 5000.0, "Freelance UI consultation payout", ExpenseStatus.PAID, emptyList(), emptyList(), null, null, t2, t2, listOf(AuditEntry(action = "Created", at = t2, summary = "Logged ₹5000 income")), EntryType.INCOME, PaymentMode.BANK, false, null)
         )
         val calcHistory = listOf(
             CalcHistoryRecord("calc-1", "5 + 10 + 15", 30.0, t2, t2)
         )
         val templates = listOf(
-            ExpenseTemplateRecord("tpl-veg", "Weekly Produce Basket", 120.0, ExpenseStatus.PAID, listOf("lbl-vegetables"), emptyList(), RecurrenceCycle.WEEKLY, null, t1),
-            ExpenseTemplateRecord("tpl-clinic", "Monthly Clinic Checkup", 500.0, ExpenseStatus.NEED, listOf("lbl-dr"), emptyList(), RecurrenceCycle.MONTHLY, null, t1)
+            ExpenseTemplateRecord("tpl-veg", "Weekly Produce Basket", 120.0, ExpenseStatus.PAID, listOf("lbl-vegetables"), emptyList(), RecurrenceCycle.WEEKLY, null, t1, EntryType.EXPENSE, PaymentMode.CASH),
+            ExpenseTemplateRecord("tpl-clinic", "Monthly Clinic Checkup", 500.0, ExpenseStatus.NEED, listOf("lbl-dr"), emptyList(), RecurrenceCycle.MONTHLY, null, t1, EntryType.EXPENSE, PaymentMode.UPI)
         )
-        return LedgerSnapshot(expenses, labels, lists, calcHistory, templates, emptyList(), 30)
+        return LedgerSnapshot(expenses, labels, lists, calcHistory, templates, emptyList(), 30, null, false)
     }
 }
