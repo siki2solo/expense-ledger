@@ -1,18 +1,15 @@
 # Expense Ledger (Android)
 
 Package ID: `com.example.expenseledger`
-Version: `1.0` (Code `1`)
+Version: `1.4` (Code `5`)
 
 ## Features Included
-- **Live Balance Dashboard**: Isolated `PAID (₹)`, `HOLD (₹)`, `NEED (₹)`, and Grand Commitment calculated strictly from active Expenses, plus optional Net Cashflow indicator when Income entries exist.
-- **Wallets & Income Cashflow (v1.3)**: Track `UPI / Cash / Card / Bank` payment modes and `Income (+₹)` vs `Expense` entries with dedicated filter chips and Insights breakdown.
-- **Privacy PIN Lock & Balance Masking (v1.3)**: 1-tap `Hide Balances (₹••••)` eye toggle and SHA-256 hashed 4-digit PIN lock overlay.
-- **Smart Paste Bank / UPI SMS (v1.3)**: Zero-permission collapsible paste auto-fill extracting amount, type, payment mode, and merchant quote inside the Entry Editor.
-- **Pinned Bills & Due Dates (v1.3)**: Pin priority entries to the top and track due countdowns (`Overdue`, `Due Today`, `Due in Xd`).
-- **Expenses**: Search bar, `Pinned / Income / Expense / Paid / Hold / Need / UPI / Cash / Card / Bank` & label filters, Bulk Select action bar, Quick Templates & Recurring Bills, 1-tap Duplicate, multi-select Labels, and expandable attached Lists.
-- **Insights (Budgets · Cashflow · Merchants · Calendar)**: Monthly budget progress bars per Label, Net Cashflow & Wallet breakdown, Most Frequent Merchants ranking, and Mon–Sun daily spend Calendar grid.
-- **Recycle Bin & Retention**: Soft-delete Expenses, Labels, Lists, and Templates into Bin with `30 / 60 / 90 Days` or `Manual Only` auto-purge, Restore, Delete Permanently, Empty Bin, and Snackbar Undo.
-- **Labels & Lists**: Isolated Paid/Hold/Need sums per label with monthly budget caps, itemized notes with auto-sum detection, and Slide-up Calculator with tape history.
-- **CSV Import / Export & Backup**: Storage Access Framework CSV Import & Export (`.csv`), JSON Backup & Restore (`.json`), Shareable plain-text summaries, and custom adaptive vector launcher icon.
-- **Persistent SQLite + JSON Storage** (`LedgerStorage.kt`).
-- **CI/CD Pipeline** (`.github/workflows/build-apk.yml`): Dual-path PKCS12 signing with `gradle assembleRelease`.
+- **Live Balance Dashboard**: Isolated `PAID (₹)`, `HOLD (₹)`, `NEED (₹)`, and Grand Commitment calculated strictly from active Expenses (with partial settlements credited live to `PAID`), plus Net Cashflow indicator when Income entries exist.
+- **Partial Payments on Hold & Need Bills (v1.4)**: Record inline `Pay Part` settlements with `25% / 50% / Full` presets and wallet tracking without double-counting totals.
+- **Live Wallet Balances & Transfers (v1.4)**: Opening balances per wallet (`UPI / Cash / Card / Bank`) plus internal transfers inside `Insights → Cashflow`.
+- **Biometric Unlock & Persistent Theme Mode (v1.4)**: Android `BiometricPrompt` (`FragmentActivity`) alongside SHA-256 4-digit PIN lock and persistent `System | Light | Dark` theme preference.
+- **Date-Range Filter, Merchant Auto-Suggest & PDF Export (v1.4)**: `Today / 7D / Month` chips, historical merchant suggestions, and formatted multi-page `PdfDocument` statement export (`.pdf`).
+- **Receipt Photo Attachments (v1.4)**: Scoped Android Photo Picker (`PickVisualMedia`, zero storage permissions required) with inline receipt viewer.
+- **Home Screen Shortcuts & Due Bill Reminders (v1.4)**: Static launcher shortcuts (`new_expense`, `quick_calc`, `insights`) and `WorkManager` daily due alerts (`BillDueWorker`).
+- **Wallets, Smart Paste SMS, Pinned/Due Dates, CSV Import/Export, 4-Tab Insights, Recycle Bin, Bulk Select, Templates & Calculator**.
+- **Persistent SQLite + JSON Storage** (`LedgerStorage.kt`) & **GitHub Actions Signed APK CI/CD** (`.github/workflows/build-apk.yml`).

@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="utf-8"?>
+<shortcuts xmlns:android="http://schemas.android.com/apk/res/android">
+    <shortcut
+        android:shortcutId="new_expense"
+        android:enabled="true"
+        android:icon="@mipmap/ic_launcher"
+        android:shortcutShortLabel="@string/shortcut_new_expense_short"
+        android:shortcutLongLabel="@string/shortcut_new_expense_long">
+        <intent
+            android:action="android.intent.action.VIEW"
+            android:targetPackage="com.example.expenseledger"
+            android:targetClass="com.example.expenseledger.MainActivity">
+            <extra android:name="shortcut_action" android:value="new_expense" />
+        </intent>
+    </shortcut>
+    <shortcut
+        android:shortcutId="quick_calc"
+        android:enabled="true"
+        android:icon="@mipmap/ic_launcher"
+        android:shortcutShortLabel="@string/shortcut_quick_calc_short"
+        android:shortcutLongLabel="@string/shortcut_quick_calc_long">
+        <intent
+            android:action="android.intent.action.VIEW"
+            android:targetPackage="com.example.expenseledger"
+            android:targetClass="com.example.expenseledger.MainActivity">
+            <extra android:name="shortcut_action" android:value="quick_calc" />
+        </intent>
+    </shortcut>
+    <shortcut
+        android:shortcutId="insights"
+        android:enabled="true"
+        android:icon="@mipmap/ic_launcher"
+        android:shortcutShortLabel="@string/shortcut_insights_short"
+        android:shortcutLongLabel="@string/shortcut_insights_long">
+        <intent
+            android:action="android.intent.action.VIEW"
+            android:targetPackage="com.example.expenseledger"
+            android:targetClass="com.example.expenseledger.MainActivity">
+            <extra android:name="shortcut_action" android:value="insights" />
+        </intent>
+    </shortcut>
+</shortcuts>

@@ -1,4 +1,10 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">Expense Ledger</string>
+    <string name="shortcut_new_expense_short">New Expense</string>
+    <string name="shortcut_new_expense_long">Log New Expense</string>
+    <string name="shortcut_quick_calc_short">Quick Calc</string>
+    <string name="shortcut_quick_calc_long">Open Quick Calculator</string>
+    <string name="shortcut_insights_short">Insights</string>
+    <string name="shortcut_insights_long">Open Spending Insights</string>
 </resources>

@@ -4,6 +4,9 @@ import android.content.ContentValues
 import android.content.Context
 import android.database.sqlite.SQLiteDatabase
 import android.database.sqlite.SQLiteOpenHelper
+import android.graphics.Paint
+import android.graphics.pdf.PdfDocument
+import android.net.Uri
 import org.json.JSONArray
 import org.json.JSONObject
 import java.security.MessageDigest
@@ -76,11 +79,52 @@ enum class BinnedEntityType(val key: String, val displayLabel: String) {
     }
 }
 
+enum class ThemeMode(val key: String, val label: String) {
+    SYSTEM("system", "System"),
+    LIGHT("light", "Light"),
+    DARK("dark", "Dark");
+
+    companion object {
+        fun fromKey(value: String): ThemeMode =
+            entries.firstOrNull { it.key.equals(value, ignoreCase = true) } ?: SYSTEM
+    }
+}
+
+enum class DateWindowFilter(val label: String) {
+    ALL("All Dates"),
+    TODAY("Today"),
+    SEVEN_DAYS("7D"),
+    MONTH("Month")
+}
+
 data class AuditEntry(
     val id: String = UUID.randomUUID().toString(),
     val action: String, // "Created" or "Updated"
     val at: String,
     val summary: String = ""
+)
+
+data class PartialPaymentRecord(
+    val id: String = "pp-" + UUID.randomUUID().toString().take(8),
+    val amount: Double,
+    val mode: PaymentMode,
+    val at: String,
+    val note: String = ""
+)
+
+data class ReceiptAttachmentRecord(
+    val name: String,
+    val uriOrDataUrl: String,
+    val attachedAt: String
+)
+
+data class WalletTransferRecord(
+    val id: String = "trf-" + UUID.randomUUID().toString().take(8),
+    val fromMode: PaymentMode,
+    val toMode: PaymentMode,
+    val amount: Double,
+    val note: String,
+    val at: String
 )
 
 data class LabelRecord(
@@ -118,7 +162,10 @@ data class ExpenseRecord(
     val entryType: EntryType = EntryType.EXPENSE,
     val paymentMode: PaymentMode = PaymentMode.UPI,
     val isPinned: Boolean = false,
-    val dueDate: String? = null
+    val dueDate: String? = null,
+    val paidAmount: Double = 0.0,
+    val partialPayments: List<PartialPaymentRecord> = emptyList(),
+    val receiptAttachment: ReceiptAttachmentRecord? = null
 )
 
 data class CalcHistoryRecord(
@@ -162,7 +209,12 @@ data class LedgerSnapshot(
     val bin: List<BinnedRecord> = emptyList(),
     val binRetentionDays: Int? = 30,
     val privacyPinHash: String? = null,
-    val hideBalances: Boolean = false
+    val hideBalances: Boolean = false,
+    val biometricEnabled: Boolean = false,
+    val themeMode: ThemeMode = ThemeMode.SYSTEM,
+    val dueRemindersEnabled: Boolean = true,
+    val walletStartingBalances: Map<PaymentMode, Double> = emptyMap(),
+    val walletTransfers: List<WalletTransferRecord> = emptyList()
 )
 
 data class CalendarDayCell(
@@ -190,12 +242,47 @@ data class WalletSummary(
     val sharePct: Int
 )
 
+data class LiveWalletBalanceRow(
+    val mode: PaymentMode,
+    val startingBalance: Double,
+    val incomeTotal: Double,
+    val cashOutflow: Double,
+    val transfersIn: Double,
+    val transfersOut: Double,
+    val liveBalance: Double
+)
+
 data class MerchantSummary(
     val displayName: String,
     val count: Int,
     val totalSpent: Double,
     val avgSpent: Double,
     val primaryMode: PaymentMode
+)
+
+data class MerchantSuggestion(
+    val merchantKey: String,
+    val quote: String,
+    val lastBalance: Double,
+    val paymentMode: PaymentMode,
+    val entryType: EntryType,
+    val status: ExpenseStatus,
+    val labelIds: List<String>,
+    val count: Int
+)
+
+data class DueAlertItem(
+    val expense: ExpenseRecord,
+    val remaining: Double,
+    val statusLabel: String,
+    val severity: String
+)
+
+data class DueAlertSummary(
+    val overdueCount: Int,
+    val dueTodayCount: Int,
+    val upcomingCount: Int,
+    val items: List<DueAlertItem>
 )
 
 data class ParsedSmsResult(
@@ -336,13 +423,24 @@ object LedgerMath {
         return firstWeekdayMon0 to cells
     }
 
+    fun expensePaidPart(exp: ExpenseRecord): Double {
+        if (exp.entryType == EntryType.INCOME) return 0.0
+        val bal = exp.balance.coerceAtLeast(0.0)
+        return if (exp.status == ExpenseStatus.PAID) bal else exp.paidAmount.coerceIn(0.0, bal)
+    }
+
+    fun expenseRemainingPart(exp: ExpenseRecord): Double {
+        if (exp.entryType == EntryType.INCOME) return 0.0
+        return (exp.balance.coerceAtLeast(0.0) - expensePaidPart(exp)).coerceAtLeast(0.0)
+    }
+
     fun computeCashflowSummary(expenses: List<ExpenseRecord>, monthKey: String? = null): CashflowSummary {
         val scope = if (monthKey.isNullOrBlank()) expenses else expenses.filter { it.createdAt.startsWith(monthKey) }
         val incomeItems = scope.filter { it.entryType == EntryType.INCOME }
         val expItems = scope.filter { it.entryType == EntryType.EXPENSE }
         val totalIncome = incomeItems.sumOf { it.balance }
-        val paidExp = expItems.filter { it.status == ExpenseStatus.PAID }.sumOf { it.balance }
-        val unpaid = expItems.filter { it.status != ExpenseStatus.PAID }.sumOf { it.balance }
+        val paidExp = expItems.sumOf { expensePaidPart(it) }
+        val unpaid = expItems.sumOf { expenseRemainingPart(it) }
         return CashflowSummary(
             totalIncome = totalIncome,
             paidExpenses = paidExp,
@@ -351,6 +449,233 @@ object LedgerMath {
             incomeCount = incomeItems.size,
             expenseCount = expItems.size
         )
+    }
+
+    fun recordPartialPayment(
+        snapshot: LedgerSnapshot,
+        expenseId: String,
+        amount: Double,
+        mode: PaymentMode,
+        note: String = ""
+    ): LedgerSnapshot {
+        val cleanAmt = kotlin.math.round(amount * 100.0) / 100.0
+        if (cleanAmt <= 0.0) return snapshot
+        val now = nowIso()
+        val updatedExpenses = snapshot.expenses.map { item ->
+            if (item.id != expenseId || item.entryType == EntryType.INCOME) {
+                item
+            } else {
+                val curPaid = expensePaidPart(item)
+                val remaining = expenseRemainingPart(item)
+                if (remaining <= 0.0) {
+                    item
+                } else {
+                    val applied = kotlin.math.round(minOf(remaining, cleanAmt) * 100.0) / 100.0
+                    val nextPaid = kotlin.math.round(minOf(item.balance, curPaid + applied) * 100.0) / 100.0
+                    val nextRem = (item.balance - nextPaid).coerceAtLeast(0.0)
+                    val settled = nextRem <= 0.009
+                    val nextStatus = if (settled) ExpenseStatus.PAID else if (item.status == ExpenseStatus.PAID) ExpenseStatus.NEED else item.status
+                    val entry = PartialPaymentRecord(amount = applied, mode = mode, at = now, note = note.trim())
+                    val summary = if (settled) {
+                        "Final settlement ₹${formatAmt(applied)} via ${mode.label} (Paid)"
+                    } else {
+                        "Partial pay ₹${formatAmt(applied)} via ${mode.label} (₹${formatAmt(nextRem)} left)"
+                    }
+                    item.copy(
+                        status = nextStatus,
+                        paidAmount = if (settled) item.balance else nextPaid,
+                        partialPayments = item.partialPayments + entry,
+                        updatedAt = now,
+                        auditLog = item.auditLog + AuditEntry(action = "Updated", at = now, summary = summary)
+                    )
+                }
+            }
+        }
+        return snapshot.copy(expenses = updatedExpenses)
+    }
+
+    fun computeLiveWalletBalances(snapshot: LedgerSnapshot): List<LiveWalletBalanceRow> {
+        val incomeMap = PaymentMode.entries.associateWith { 0.0 }.toMutableMap()
+        val outflowMap = PaymentMode.entries.associateWith { 0.0 }.toMutableMap()
+        val tInMap = PaymentMode.entries.associateWith { 0.0 }.toMutableMap()
+        val tOutMap = PaymentMode.entries.associateWith { 0.0 }.toMutableMap()
+
+        snapshot.expenses.forEach { exp ->
+            if (exp.entryType == EntryType.INCOME) {
+                incomeMap[exp.paymentMode] = (incomeMap[exp.paymentMode] ?: 0.0) + exp.balance.coerceAtLeast(0.0)
+            } else {
+                var tracked = 0.0
+                exp.partialPayments.forEach { pp ->
+                    val amt = pp.amount.coerceAtLeast(0.0)
+                    outflowMap[pp.mode] = (outflowMap[pp.mode] ?: 0.0) + amt
+                    tracked += amt
+                }
+                val paidPart = expensePaidPart(exp)
+                val unattributed = (paidPart - tracked).coerceAtLeast(0.0)
+                if (unattributed > 0.0) {
+                    outflowMap[exp.paymentMode] = (outflowMap[exp.paymentMode] ?: 0.0) + unattributed
+                }
+            }
+        }
+
+        snapshot.walletTransfers.forEach { trf ->
+            if (trf.amount > 0.0 && trf.fromMode != trf.toMode) {
+                tOutMap[trf.fromMode] = (tOutMap[trf.fromMode] ?: 0.0) + trf.amount
+                tInMap[trf.toMode] = (tInMap[trf.toMode] ?: 0.0) + trf.amount
+            }
+        }
+
+        return PaymentMode.entries.map { mode ->
+            val startBal = snapshot.walletStartingBalances[mode] ?: 0.0
+            val inc = incomeMap[mode] ?: 0.0
+            val out = outflowMap[mode] ?: 0.0
+            val tIn = tInMap[mode] ?: 0.0
+            val tOut = tOutMap[mode] ?: 0.0
+            LiveWalletBalanceRow(
+                mode = mode,
+                startingBalance = startBal,
+                incomeTotal = inc,
+                cashOutflow = out,
+                transfersIn = tIn,
+                transfersOut = tOut,
+                liveBalance = kotlin.math.round((startBal + inc - out - tOut + tIn) * 100.0) / 100.0
+            )
+        }
+    }
+
+    fun filterByDateWindow(exp: ExpenseRecord, window: DateWindowFilter): Boolean {
+        if (window == DateWindowFilter.ALL) return true
+        if (exp.createdAt.length < 10) return false
+        val fmt = SimpleDateFormat("yyyy-MM-dd", Locale.US).apply { timeZone = TimeZone.getTimeZone("UTC") }
+        val todayStr = fmt.format(Date())
+        val datePart = exp.createdAt.take(10)
+        return when (window) {
+            DateWindowFilter.ALL -> true
+            DateWindowFilter.TODAY -> datePart == todayStr
+            DateWindowFilter.MONTH -> datePart.take(7) == todayStr.take(7)
+            DateWindowFilter.SEVEN_DAYS -> {
+                val expMs = fmt.parse(datePart)?.time ?: return false
+                val todayMs = fmt.parse(todayStr)?.time ?: return false
+                val diffDays = (todayMs - expMs) / MS_PER_DAY
+                diffDays in 0..6
+            }
+        }
+    }
+
+    fun suggestMerchants(expenses: List<ExpenseRecord>, query: String, limit: Int = 4): List<MerchantSuggestion> {
+        val q = query.trim().lowercase(Locale.US)
+        if (q.length < 2) return emptyList()
+        val buckets = linkedMapOf<String, MutableList<ExpenseRecord>>()
+        expenses.forEach { exp ->
+            val clean = exp.quote.replace(Regex("""\s*\(copy\)\s*$""", RegexOption.IGNORE_CASE), "").trim()
+            if (clean.isNotBlank() && clean.lowercase(Locale.US).contains(q)) {
+                buckets.getOrPut(clean.lowercase(Locale.US)) { mutableListOf() }.add(exp)
+            }
+        }
+        return buckets.entries.map { (k, list) ->
+            val latest = list.maxByOrNull { it.createdAt } ?: list.first()
+            MerchantSuggestion(
+                merchantKey = k,
+                quote = latest.quote.replace(Regex("""\s*\(copy\)\s*$""", RegexOption.IGNORE_CASE), "").trim(),
+                lastBalance = latest.balance,
+                paymentMode = latest.paymentMode,
+                entryType = latest.entryType,
+                status = latest.status,
+                labelIds = latest.labelIds,
+                count = list.size
+            )
+        }.sortedByDescending { it.count }.take(limit)
+    }
+
+    fun collectDueAlerts(expenses: List<ExpenseRecord>): DueAlertSummary {
+        var overdue = 0
+        var today = 0
+        var upcoming = 0
+        val items = mutableListOf<DueAlertItem>()
+        expenses.forEach { exp ->
+            if (exp.entryType == EntryType.INCOME || exp.status == ExpenseStatus.PAID || exp.dueDate.isNullOrBlank()) return@forEach
+            val rem = expenseRemainingPart(exp)
+            if (rem <= 0.0) return@forEach
+            val lbl = computeDueLabel(exp.dueDate, exp.status, exp.entryType) ?: return@forEach
+            val sev = when {
+                lbl.startsWith("Overdue") -> { overdue++; "overdue" }
+                lbl == "Due Today" -> { today++; "today" }
+                else -> { upcoming++; "upcoming" }
+            }
+            items.add(DueAlertItem(exp, rem, lbl, sev))
+        }
+        val order = mapOf("overdue" to 0, "today" to 1, "upcoming" to 2)
+        return DueAlertSummary(overdue, today, upcoming, items.sortedBy { order[it.severity] ?: 3 })
+    }
+
+    fun writeLedgerPdfStatement(
+        context: Context,
+        uri: Uri,
+        snapshot: LedgerSnapshot,
+        appName: String,
+        labelId: String?,
+        monthKey: String?
+    ): Boolean {
+        val targetLabel = labelId?.let { id -> snapshot.labels.firstOrNull { it.id == id } }
+        val filtered = snapshot.expenses.filter { exp ->
+            val matchLbl = targetLabel == null || exp.labelIds.contains(targetLabel.id)
+            val matchMonth = monthKey.isNullOrBlank() || exp.createdAt.startsWith(monthKey)
+            matchLbl && matchMonth
+        }
+        val expOnly = filtered.filter { it.entryType == EntryType.EXPENSE }
+        val paid = expOnly.sumOf { expensePaidPart(it) }
+        val hold = expOnly.filter { it.status == ExpenseStatus.HOLD }.sumOf { expenseRemainingPart(it) }
+        val need = expOnly.filter { it.status == ExpenseStatus.NEED }.sumOf { expenseRemainingPart(it) }
+        val netFlow = computeCashflowSummary(filtered).netCashflow
+
+        val doc = PdfDocument()
+        val pageWidth = 595
+        val pageHeight = 842
+        var pageNum = 1
+        var page = doc.startPage(PdfDocument.PageInfo.Builder(pageWidth, pageHeight, pageNum).create())
+        var canvas = page.canvas
+        val titlePaint = Paint().apply { textSize = 16f; isFakeBoldText = true; color = android.graphics.Color.rgb(15, 23, 42) }
+        val subPaint = Paint().apply { textSize = 10f; color = android.graphics.Color.rgb(71, 85, 105) }
+        val rowPaint = Paint().apply { textSize = 10f; color = android.graphics.Color.rgb(30, 41, 59) }
+        val boldPaint = Paint().apply { textSize = 10.5f; isFakeBoldText = true; color = android.graphics.Color.rgb(15, 23, 42) }
+
+        var y = 48f
+        canvas.drawText("$appName — Statement", 36f, y, titlePaint)
+        y += 18f
+        canvas.drawText("Scope: ${targetLabel?.name ?: "All Entries"} · Period: ${monthKey ?: "All Time"}", 36f, y, subPaint)
+        y += 18f
+        canvas.drawText("PAID: ₹${formatAmt(paid)} | HOLD: ₹${formatAmt(hold)} | NEED: ₹${formatAmt(need)} | Net: ₹${formatAmt(netFlow)}", 36f, y, boldPaint)
+        y += 22f
+        canvas.drawLine(36f, y, pageWidth - 36f, y, subPaint)
+        y += 18f
+
+        filtered.forEach { exp ->
+            if (y > pageHeight - 50) {
+                doc.finishPage(page)
+                pageNum++
+                page = doc.startPage(PdfDocument.PageInfo.Builder(pageWidth, pageHeight, pageNum).create())
+                canvas = page.canvas
+                y = 48f
+            }
+            val dateStr = exp.createdAt.take(10)
+            val tagStr = if (exp.entryType == EntryType.INCOME) "INCOME" else exp.status.label.uppercase()
+            val amtStr = (if (exp.entryType == EntryType.INCOME) "+" else "") + "₹" + formatAmt(exp.balance)
+            val line = "$dateStr  [$tagStr · ${exp.paymentMode.label}]  $amtStr  ${exp.quote.take(44)}"
+            canvas.drawText(line, 36f, y, rowPaint)
+            y += 16f
+        }
+        doc.finishPage(page)
+
+        return try {
+            context.contentResolver.openOutputStream(uri)?.use { stream ->
+                doc.writeTo(stream)
+            }
+            true
+        } catch (_: Exception) {
+            false
+        } finally {
+            doc.close()
+        }
     }
 
     fun computeWalletBreakdown(expenses: List<ExpenseRecord>, monthKey: String? = null): List<WalletSummary> {
@@ -812,6 +1137,25 @@ class LedgerDbHelper(context: Context) : SQLiteOpenHelper(context, "expense_ledg
     fun encodeExpense(e: ExpenseRecord): JSONObject = JSONObject().apply {
         put("id", e.id)
         put("balance", e.balance)
+        put("paidAmount", e.paidAmount)
+        put("partialPayments", JSONArray().apply {
+            e.partialPayments.forEach { pp ->
+                put(JSONObject().apply {
+                    put("id", pp.id)
+                    put("amount", pp.amount)
+                    put("mode", pp.mode.label)
+                    put("at", pp.at)
+                    if (pp.note.isNotBlank()) put("note", pp.note)
+                })
+            }
+        })
+        if (e.receiptAttachment != null) {
+            put("receiptAttachment", JSONObject().apply {
+                put("name", e.receiptAttachment.name)
+                put("uriOrDataUrl", e.receiptAttachment.uriOrDataUrl)
+                put("attachedAt", e.receiptAttachment.attachedAt)
+            })
+        }
         put("quote", e.quote)
         put("status", e.status.label)
         put("entryType", e.entryType.label)
@@ -871,6 +1215,23 @@ class LedgerDbHelper(context: Context) : SQLiteOpenHelper(context, "expense_ledg
                 })
             }
         }
+        val startObj = JSONObject().apply {
+            PaymentMode.entries.forEach { m ->
+                put(m.label, snapshot.walletStartingBalances[m] ?: 0.0)
+            }
+        }
+        val trfArr = JSONArray().apply {
+            snapshot.walletTransfers.forEach { t ->
+                put(JSONObject().apply {
+                    put("id", t.id)
+                    put("fromMode", t.fromMode.label)
+                    put("toMode", t.toMode.label)
+                    put("amount", t.amount)
+                    put("note", t.note)
+                    put("at", t.at)
+                })
+            }
+        }
         root.put("labels", labelsArr)
         root.put("lists", listsArr)
         root.put("expenses", expArr)
@@ -879,7 +1240,12 @@ class LedgerDbHelper(context: Context) : SQLiteOpenHelper(context, "expense_ledg
         root.put("bin", binArr)
         root.put("binRetentionDays", snapshot.binRetentionDays ?: JSONObject.NULL)
         root.put("privacyPinHash", snapshot.privacyPinHash ?: JSONObject.NULL)
+        root.put("biometricEnabled", snapshot.biometricEnabled)
         root.put("hideBalances", snapshot.hideBalances)
+        root.put("themeMode", snapshot.themeMode.key)
+        root.put("dueRemindersEnabled", snapshot.dueRemindersEnabled)
+        root.put("walletStartingBalances", startObj)
+        root.put("walletTransfers", trfArr)
         return root.toString()
     }
 
@@ -937,12 +1303,45 @@ class LedgerDbHelper(context: Context) : SQLiteOpenHelper(context, "expense_ledg
         val createdAt = o.optString("createdAt")
         val audit = decodeAuditList(o.optJSONArray("auditLog"))
         val updatedAt = o.optString("updatedAt").ifBlank { audit.lastOrNull()?.at ?: createdAt }
+        val status = ExpenseStatus.fromString(o.optString("status", "Need"))
+        val balance = o.optDouble("balance", 0.0).coerceAtLeast(0.0)
+        val rawPaid = o.optDouble("paidAmount", if (status == ExpenseStatus.PAID) balance else 0.0)
+        val paidAmount = if (status == ExpenseStatus.PAID) balance else rawPaid.coerceIn(0.0, balance)
+
+        val partials = mutableListOf<PartialPaymentRecord>()
+        val ppArr = o.optJSONArray("partialPayments")
+        if (ppArr != null) {
+            for (j in 0 until ppArr.length()) {
+                val po = ppArr.optJSONObject(j) ?: continue
+                val pAmt = po.optDouble("amount", 0.0)
+                if (pAmt > 0.0) {
+                    partials.add(
+                        PartialPaymentRecord(
+                            id = po.optString("id").ifBlank { "pp-$j" },
+                            amount = pAmt,
+                            mode = PaymentMode.fromString(po.optString("mode", "UPI")),
+                            at = po.optString("at", createdAt),
+                            note = po.optString("note", "")
+                        )
+                    )
+                }
+            }
+        }
+
+        val rObj = o.optJSONObject("receiptAttachment")
+        val receipt = if (rObj != null && rObj.optString("uriOrDataUrl").isNotBlank()) {
+            ReceiptAttachmentRecord(
+                name = rObj.optString("name", "Receipt.jpg"),
+                uriOrDataUrl = rObj.optString("uriOrDataUrl"),
+                attachedAt = rObj.optString("attachedAt", createdAt)
+            )
+        } else null
 
         return ExpenseRecord(
             id = o.optString("id"),
-            balance = o.optDouble("balance", 0.0),
+            balance = balance,
             quote = o.optString("quote"),
-            status = ExpenseStatus.fromString(o.optString("status", "Need")),
+            status = status,
             labelIds = lblIds,
             attachedListIds = attachedIds,
             calcHistoryId = calcHistoryId,
@@ -953,7 +1352,10 @@ class LedgerDbHelper(context: Context) : SQLiteOpenHelper(context, "expense_ledg
             entryType = EntryType.fromString(o.optString("entryType", "Expense")),
             paymentMode = PaymentMode.fromString(o.optString("paymentMode", "UPI")),
             isPinned = o.optBoolean("isPinned", false),
-            dueDate = dueDate
+            dueDate = dueDate,
+            paidAmount = paidAmount,
+            partialPayments = partials,
+            receiptAttachment = receipt
         )
     }
 
@@ -1055,9 +1457,51 @@ class LedgerDbHelper(context: Context) : SQLiteOpenHelper(context, "expense_ledg
             }
 
             val pinHash = if (root.isNull("privacyPinHash")) null else root.optString("privacyPinHash").takeIf { it.isNotBlank() }
+            val biometricEnabled = root.optBoolean("biometricEnabled", false)
             val hideBalances = root.optBoolean("hideBalances", false)
+            val themeMode = ThemeMode.fromKey(root.optString("themeMode", "system"))
+            val dueRemindersEnabled = root.optBoolean("dueRemindersEnabled", true)
 
-            LedgerSnapshot(expenses, labels, lists, calcHistory, templates, LedgerMath.pruneExpiredBin(bin, retention), retention, pinHash, hideBalances)
+            val startObj = root.optJSONObject("walletStartingBalances")
+            val startingBalances = PaymentMode.entries.associateWith { m ->
+                startObj?.optDouble(m.label, 0.0) ?: 0.0
+            }
+
+            val transfers = mutableListOf<WalletTransferRecord>()
+            val trfArr = root.optJSONArray("walletTransfers") ?: JSONArray()
+            for (i in 0 until trfArr.length()) {
+                val o = trfArr.optJSONObject(i) ?: continue
+                val amt = o.optDouble("amount", 0.0)
+                if (amt > 0.0) {
+                    transfers.add(
+                        WalletTransferRecord(
+                            id = o.optString("id").ifBlank { "trf-$i" },
+                            fromMode = PaymentMode.fromString(o.optString("fromMode", "Bank")),
+                            toMode = PaymentMode.fromString(o.optString("toMode", "UPI")),
+                            amount = amt,
+                            note = o.optString("note", "Wallet transfer"),
+                            at = o.optString("at", LedgerMath.nowIso())
+                        )
+                    )
+                }
+            }
+
+            LedgerSnapshot(
+                expenses = expenses,
+                labels = labels,
+                lists = lists,
+                calculatorHistory = calcHistory,
+                templates = templates,
+                bin = LedgerMath.pruneExpiredBin(bin, retention),
+                binRetentionDays = retention,
+                privacyPinHash = pinHash,
+                hideBalances = hideBalances,
+                biometricEnabled = biometricEnabled,
+                themeMode = themeMode,
+                dueRemindersEnabled = dueRemindersEnabled,
+                walletStartingBalances = startingBalances,
+                walletTransfers = transfers
+            )
         } catch (_: Exception) {
             createSeedSnapshot()
         }
@@ -1255,6 +1699,23 @@ class LedgerDbHelper(context: Context) : SQLiteOpenHelper(context, "expense_ledg
             ExpenseTemplateRecord("tpl-veg", "Weekly Produce Basket", 120.0, ExpenseStatus.PAID, listOf("lbl-vegetables"), emptyList(), RecurrenceCycle.WEEKLY, null, t1, EntryType.EXPENSE, PaymentMode.CASH),
             ExpenseTemplateRecord("tpl-clinic", "Monthly Clinic Checkup", 500.0, ExpenseStatus.NEED, listOf("lbl-dr"), emptyList(), RecurrenceCycle.MONTHLY, null, t1, EntryType.EXPENSE, PaymentMode.UPI)
         )
-        return LedgerSnapshot(expenses, labels, lists, calcHistory, templates, emptyList(), 30, null, false)
+        val startBalances = mapOf(PaymentMode.UPI to 4000.0, PaymentMode.CASH to 1500.0, PaymentMode.CARD to 0.0, PaymentMode.BANK to 12000.0)
+        val seedTransfers = listOf(WalletTransferRecord("trf-seed-1", PaymentMode.BANK, PaymentMode.UPI, 2000.0, "Weekly UPI wallet top-up", t2))
+        return LedgerSnapshot(
+            expenses = expenses,
+            labels = labels,
+            lists = lists,
+            calculatorHistory = calcHistory,
+            templates = templates,
+            bin = emptyList(),
+            binRetentionDays = 30,
+            privacyPinHash = null,
+            hideBalances = false,
+            biometricEnabled = false,
+            themeMode = ThemeMode.SYSTEM,
+            dueRemindersEnabled = true,
+            walletStartingBalances = startBalances,
+            walletTransfers = seedTransfers
+        )
     }
 }

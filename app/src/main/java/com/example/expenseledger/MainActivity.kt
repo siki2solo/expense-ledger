@@ -1,17 +1,26 @@
 package com.example.expenseledger
 
+import android.Manifest
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.content.res.Configuration
+import android.graphics.BitmapFactory
+import android.net.Uri
+import android.os.Build
 import android.os.Bundle
-import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
+import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.biometric.BiometricManager
+import androidx.biometric.BiometricPrompt
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -28,6 +37,8 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
@@ -37,20 +48,61 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.core.content.ContextCompat
+import androidx.fragment.app.FragmentActivity
 import kotlinx.coroutines.launch
 import kotlin.math.round
 
-class MainActivity : ComponentActivity() {
+class MainActivity : FragmentActivity() {
+    private var shortcutActionState by mutableStateOf<String?>(null)
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        shortcutActionState = intent?.getStringExtra("shortcut_action")
         setContent {
-            ExpenseLedgerApp()
+            ExpenseLedgerApp(
+                initialShortcutAction = shortcutActionState,
+                onConsumeShortcutAction = { shortcutActionState = null }
+            )
+        }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        val act = intent.getStringExtra("shortcut_action")
+        if (!act.isNullOrBlank()) {
+            shortcutActionState = act
         }
     }
 
     override fun onConfigurationChanged(newConfig: Configuration) {
         super.onConfigurationChanged(newConfig)
     }
+}
+
+private fun triggerBiometricAuth(activity: FragmentActivity?, onSuccess: () -> Unit) {
+    if (activity == null) return
+    val manager = BiometricManager.from(activity)
+    val authenticators = BiometricManager.Authenticators.BIOMETRIC_STRONG or
+        BiometricManager.Authenticators.BIOMETRIC_WEAK or
+        BiometricManager.Authenticators.DEVICE_CREDENTIAL
+    if (manager.canAuthenticate(authenticators) != BiometricManager.BIOMETRIC_SUCCESS) return
+    val prompt = BiometricPrompt(
+        activity,
+        ContextCompat.getMainExecutor(activity),
+        object : BiometricPrompt.AuthenticationCallback() {
+            override fun onAuthenticationSucceeded(result: BiometricPrompt.AuthenticationResult) {
+                onSuccess()
+            }
+        }
+    )
+    val info = BiometricPrompt.PromptInfo.Builder()
+        .setTitle("Unlock Expense Ledger")
+        .setSubtitle("Verify your fingerprint, face, or device PIN")
+        .setAllowedAuthenticators(authenticators)
+        .build()
+    prompt.authenticate(info)
 }
 
 private enum class LedgerTab(val title: String) {
@@ -78,13 +130,20 @@ private fun parseColorHex(hex: String): Color {
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun ExpenseLedgerApp() {
+fun ExpenseLedgerApp(
+    initialShortcutAction: String? = null,
+    onConsumeShortcutAction: () -> Unit = {}
+) {
     val context = LocalContext.current
+    val activity = context as? FragmentActivity
     val dbHelper = remember { LedgerDbHelper(context) }
 
     var snapshot by remember { mutableStateOf(dbHelper.loadSnapshot()) }
     var activeTab by remember { mutableStateOf(LedgerTab.EXPENSES) }
-    var isDark by remember { mutableStateOf(false) }
+
+    LaunchedEffect(Unit) {
+        BillDueScheduler.sync(context, snapshot.dueRemindersEnabled)
+    }
 
     var showExpenseModal by remember { mutableStateOf(false) }
     var editingExpense by remember { mutableStateOf<ExpenseRecord?>(null) }
@@ -99,6 +158,7 @@ fun ExpenseLedgerApp() {
     var prefillAttachedListIds by remember { mutableStateOf<List<String>>(emptyList()) }
     var prefillCalcHistoryId by remember { mutableStateOf<String?>(null) }
     var prefillCalcFormula by remember { mutableStateOf<String?>(null) }
+    var pendingReceiptAttachment by remember { mutableStateOf<ReceiptAttachmentRecord?>(null) }
 
     var showLabelModal by remember { mutableStateOf(false) }
     var editingLabel by remember { mutableStateOf<LabelRecord?>(null) }
@@ -114,22 +174,54 @@ fun ExpenseLedgerApp() {
     var statusFilter by remember { mutableStateOf<ExpenseStatus?>(null) }
     var entryTypeFilter by remember { mutableStateOf<EntryType?>(null) }
     var paymentModeFilter by remember { mutableStateOf<PaymentMode?>(null) }
+    var dateWindowFilter by remember { mutableStateOf(DateWindowFilter.ALL) }
     var pinnedOnlyFilter by remember { mutableStateOf(false) }
     var labelFilterId by remember { mutableStateOf<String?>(null) }
     var showOverflowMenu by remember { mutableStateOf(false) }
     var showShareDialog by remember { mutableStateOf(false) }
     var shareLabelId by remember { mutableStateOf<String?>(null) }
 
-    // v1.2 & v1.3 Controls: Insights, Recycle Bin, Bulk Select, Quick Templates, Privacy PIN & CSV Import
+    // v1.2, v1.3 & v1.4 Controls: Insights, Bin, Bulk Select, Templates, Privacy/Biometrics, CSV, Partial Pay & Receipts
     var showInsightsDialog by remember { mutableStateOf(false) }
     var showBinDialog by remember { mutableStateOf(false) }
     var showPrivacyDialog by remember { mutableStateOf(false) }
     var showCsvImportDialog by remember { mutableStateOf(false) }
+    var partialPayTarget by remember { mutableStateOf<ExpenseRecord?>(null) }
+    var receiptLightboxRecord by remember { mutableStateOf<ExpenseRecord?>(null) }
+    var pendingPdfLabelId by remember { mutableStateOf<String?>(null) }
+    var pendingPdfMonthKey by remember { mutableStateOf<String?>(null) }
     var pendingCsvText by remember { mutableStateOf("") }
     var isLocked by remember { mutableStateOf(!snapshot.privacyPinHash.isNullOrBlank()) }
     var bulkMode by remember { mutableStateOf(false) }
     var selectedExpenseIds by remember { mutableStateOf<Set<String>>(emptySet()) }
     var showQuickTemplates by remember { mutableStateOf(true) }
+
+    LaunchedEffect(initialShortcutAction, isLocked) {
+        if (!initialShortcutAction.isNullOrBlank() && !isLocked) {
+            when (initialShortcutAction) {
+                "new_expense" -> {
+                    activeTab = LedgerTab.EXPENSES
+                    editingExpense = null
+                    prefillBalance = ""
+                    prefillQuote = ""
+                    prefillStatus = null
+                    prefillEntryType = EntryType.EXPENSE
+                    prefillPaymentMode = PaymentMode.UPI
+                    prefillIsPinned = false
+                    prefillDueDate = ""
+                    prefillLabelIds = emptyList()
+                    prefillAttachedListIds = emptyList()
+                    prefillCalcHistoryId = null
+                    prefillCalcFormula = null
+                    pendingReceiptAttachment = null
+                    showExpenseModal = true
+                }
+                "quick_calc" -> showCalculatorSheet = true
+                "insights" -> showInsightsDialog = true
+            }
+            onConsumeShortcutAction()
+        }
+    }
 
     val snackbarHostState = remember { SnackbarHostState() }
     val coroutineScope = rememberCoroutineScope()
@@ -183,6 +275,47 @@ fun ExpenseLedgerApp() {
         }
     }
 
+    val exportPdfLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.CreateDocument("application/pdf")
+    ) { uri ->
+        if (uri != null) {
+            val ok = LedgerMath.writeLedgerPdfStatement(
+                context = context,
+                uri = uri,
+                snapshot = snapshot,
+                appName = "Expense Ledger",
+                labelId = pendingPdfLabelId,
+                monthKey = pendingPdfMonthKey
+            )
+            showActionSnackbar(if (ok) "Saved PDF statement" else "Could not generate PDF")
+        }
+    }
+
+    val receiptPickerLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.PickVisualMedia()
+    ) { uri ->
+        if (uri != null) {
+            try {
+                context.contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            } catch (_: Exception) {
+            }
+            pendingReceiptAttachment = ReceiptAttachmentRecord(
+                name = uri.lastPathSegment?.substringAfterLast('/') ?: "Receipt Photo",
+                uriOrDataUrl = uri.toString(),
+                attachedAt = LedgerMath.nowIso()
+            )
+        }
+    }
+
+    val notifPermissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        val next = snapshot.copy(dueRemindersEnabled = granted)
+        persist(next)
+        BillDueScheduler.sync(context, granted)
+        showActionSnackbar(if (granted) "Due bill reminders enabled" else "Notification permission denied")
+    }
+
     val importCsvLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenDocument()
     ) { uri ->
@@ -219,24 +352,30 @@ fun ExpenseLedgerApp() {
         }
     }
 
-    // Global commitment sums remain strictly Expense-only
+    // Global commitment sums remain strictly Expense-only and partial-settlement aware
     val expenseOnly = remember(snapshot.expenses) {
         snapshot.expenses.filter { it.entryType == EntryType.EXPENSE }
     }
     val paidTotal = remember(expenseOnly) {
-        expenseOnly.filter { it.status == ExpenseStatus.PAID }.sumOf { it.balance }
+        expenseOnly.sumOf { LedgerMath.expensePaidPart(it) }
     }
     val holdTotal = remember(expenseOnly) {
-        expenseOnly.filter { it.status == ExpenseStatus.HOLD }.sumOf { it.balance }
+        expenseOnly.filter { it.status == ExpenseStatus.HOLD }.sumOf { LedgerMath.expenseRemainingPart(it) }
     }
     val needTotal = remember(expenseOnly) {
-        expenseOnly.filter { it.status == ExpenseStatus.NEED }.sumOf { it.balance }
+        expenseOnly.filter { it.status == ExpenseStatus.NEED }.sumOf { LedgerMath.expenseRemainingPart(it) }
     }
     val grandTotal = paidTotal + holdTotal + needTotal
     val cashflow = remember(snapshot.expenses) {
         LedgerMath.computeCashflowSummary(snapshot.expenses)
     }
 
+    val sysDark = isSystemInDarkTheme()
+    val isDark = when (snapshot.themeMode) {
+        ThemeMode.LIGHT -> false
+        ThemeMode.DARK -> true
+        ThemeMode.SYSTEM -> sysDark
+    }
     val colorScheme = if (isDark) darkColorScheme() else lightColorScheme(
         background = Color(0xFFF8FAFC),
         surface = Color(0xFFFFFFFF),
@@ -290,7 +429,10 @@ fun ExpenseLedgerApp() {
                                     Icon(Icons.Default.DeleteOutline, contentDescription = "Recycle Bin")
                                 }
                             }
-                            IconButton(onClick = { isDark = !isDark }) {
+                            IconButton(onClick = {
+                                val nextMode = if (isDark) ThemeMode.LIGHT else ThemeMode.DARK
+                                persist(snapshot.copy(themeMode = nextMode))
+                            }) {
                                 Icon(
                                     imageVector = if (isDark) Icons.Default.LightMode else Icons.Default.DarkMode,
                                     contentDescription = "Toggle theme"
@@ -443,6 +585,7 @@ fun ExpenseLedgerApp() {
                                     prefillAttachedListIds = emptyList()
                                     prefillCalcHistoryId = null
                                     prefillCalcFormula = null
+                                    pendingReceiptAttachment = null
                                     showExpenseModal = true
                                 }
                                 LedgerTab.LABELS -> {
@@ -479,6 +622,7 @@ fun ExpenseLedgerApp() {
                         statusFilter = statusFilter,
                         entryTypeFilter = entryTypeFilter,
                         paymentModeFilter = paymentModeFilter,
+                        dateWindowFilter = dateWindowFilter,
                         pinnedOnlyFilter = pinnedOnlyFilter,
                         labelFilterId = labelFilterId,
                         bulkMode = bulkMode,
@@ -488,6 +632,7 @@ fun ExpenseLedgerApp() {
                         onStatusFilterChange = { statusFilter = it },
                         onEntryTypeFilterChange = { entryTypeFilter = it },
                         onPaymentModeFilterChange = { paymentModeFilter = it },
+                        onDateWindowFilterChange = { dateWindowFilter = it },
                         onPinnedOnlyFilterChange = { pinnedOnlyFilter = it },
                         onLabelFilterChange = { labelFilterId = it },
                         onClearFilters = {
@@ -495,6 +640,7 @@ fun ExpenseLedgerApp() {
                             statusFilter = null
                             entryTypeFilter = null
                             paymentModeFilter = null
+                            dateWindowFilter = DateWindowFilter.ALL
                             pinnedOnlyFilter = false
                             labelFilterId = null
                         },
@@ -516,8 +662,10 @@ fun ExpenseLedgerApp() {
                                 val count = selectedExpenseIds.size
                                 val updated = snapshot.expenses.map { item ->
                                     if (selectedExpenseIds.contains(item.id) && item.status != targetStatus) {
+                                        val nextPaid = if (targetStatus == ExpenseStatus.PAID) item.balance else item.paidAmount.coerceIn(0.0, item.balance)
                                         item.copy(
                                             status = targetStatus,
+                                            paidAmount = if (nextPaid >= item.balance && targetStatus != ExpenseStatus.PAID) 0.0 else nextPaid,
                                             updatedAt = now,
                                             auditLog = item.auditLog + AuditEntry(
                                                 action = "Updated",
@@ -568,7 +716,8 @@ fun ExpenseLedgerApp() {
                                 entryType = tpl.entryType,
                                 paymentMode = tpl.paymentMode,
                                 isPinned = false,
-                                dueDate = null
+                                dueDate = null,
+                                paidAmount = if (tpl.entryType == EntryType.INCOME || tpl.defaultStatus == ExpenseStatus.PAID) tpl.balance else 0.0
                             )
                             val updatedTemplates = snapshot.templates.map { item ->
                                 if (item.id == tpl.id) item.copy(lastUsedAt = now) else item
@@ -592,6 +741,7 @@ fun ExpenseLedgerApp() {
                                 if (item.id == exp.id) {
                                     item.copy(
                                         status = nextStatus,
+                                        paidAmount = if (nextStatus == ExpenseStatus.PAID) item.balance else 0.0,
                                         updatedAt = now,
                                         auditLog = item.auditLog + AuditEntry(
                                             action = "Updated",
@@ -621,13 +771,15 @@ fun ExpenseLedgerApp() {
                             }
                             persist(snapshot.copy(expenses = updatedExpenses))
                         },
+                        onPartialPay = { exp -> partialPayTarget = exp },
+                        onViewReceipt = { exp -> receiptLightboxRecord = exp },
                         onDuplicate = { exp ->
                             val prev = snapshot
                             val now = LedgerMath.nowIso()
                             val copy = ExpenseRecord(
                                 balance = exp.balance,
                                 quote = "${exp.quote} (Copy)",
-                                status = exp.status,
+                                status = if (exp.entryType == EntryType.INCOME) ExpenseStatus.PAID else ExpenseStatus.NEED,
                                 labelIds = exp.labelIds,
                                 attachedListIds = exp.attachedListIds,
                                 calcHistoryId = exp.calcHistoryId,
@@ -662,6 +814,7 @@ fun ExpenseLedgerApp() {
                             prefillAttachedListIds = exp.attachedListIds
                             prefillCalcHistoryId = exp.calcHistoryId
                             prefillCalcFormula = exp.calcFormula
+                            pendingReceiptAttachment = exp.receiptAttachment
                             showExpenseModal = true
                         },
                         onDelete = { expId ->
@@ -701,6 +854,7 @@ fun ExpenseLedgerApp() {
                             prefillAttachedListIds = emptyList()
                             prefillCalcHistoryId = null
                             prefillCalcFormula = null
+                            pendingReceiptAttachment = null
                             activeTab = LedgerTab.EXPENSES
                             showExpenseModal = true
                         },
@@ -737,6 +891,7 @@ fun ExpenseLedgerApp() {
                             prefillAttachedListIds = listOf(lst.id)
                             prefillCalcHistoryId = null
                             prefillCalcFormula = null
+                            pendingReceiptAttachment = null
                             activeTab = LedgerTab.EXPENSES
                             showExpenseModal = true
                         }
@@ -758,8 +913,14 @@ fun ExpenseLedgerApp() {
                 initialLabelIds = prefillLabelIds,
                 initialAttachedListIds = prefillAttachedListIds,
                 calcFormula = prefillCalcFormula,
+                receiptAttachment = pendingReceiptAttachment,
+                expensesHistory = snapshot.expenses,
                 labels = snapshot.labels,
                 lists = snapshot.lists,
+                onPickReceiptPhoto = {
+                    receiptPickerLauncher.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
+                },
+                onClearReceiptPhoto = { pendingReceiptAttachment = null },
                 onDismiss = { showExpenseModal = false },
                 onSave = { balance, quote, status, labelIds, attachedListIds, saveAsTemplate, recurrence, entryType, paymentMode, isPinned, dueDate ->
                     val now = LedgerMath.nowIso()
@@ -780,12 +941,15 @@ fun ExpenseLedgerApp() {
                             entryType = entryType,
                             paymentMode = paymentMode,
                             isPinned = isPinned,
-                            dueDate = normalizedDue
+                            dueDate = normalizedDue,
+                            paidAmount = if (finalStatus == ExpenseStatus.PAID) balance else 0.0,
+                            receiptAttachment = pendingReceiptAttachment
                         )
                         listOf(entry) + snapshot.expenses
                     } else {
                         snapshot.expenses.map { item ->
                             if (item.id == editingExpense!!.id) {
+                                val nextPaid = if (finalStatus == ExpenseStatus.PAID) balance else item.paidAmount.coerceIn(0.0, balance)
                                 item.copy(
                                     balance = balance,
                                     quote = quote,
@@ -799,7 +963,9 @@ fun ExpenseLedgerApp() {
                                     entryType = entryType,
                                     paymentMode = paymentMode,
                                     isPinned = isPinned,
-                                    dueDate = normalizedDue
+                                    dueDate = normalizedDue,
+                                    paidAmount = nextPaid,
+                                    receiptAttachment = pendingReceiptAttachment
                                 )
                             } else item
                         }
@@ -961,6 +1127,12 @@ fun ExpenseLedgerApp() {
                     pendingCsvText = ""
                     showCsvImportDialog = true
                 },
+                onExportPdf = { lblId, monthKey ->
+                    pendingPdfLabelId = lblId
+                    pendingPdfMonthKey = monthKey
+                    showShareDialog = false
+                    exportPdfLauncher.launch("expense-ledger-statement.pdf")
+                },
                 onShareText = { summaryText ->
                     val sendIntent = Intent(Intent.ACTION_SEND).apply {
                         type = "text/plain"
@@ -975,6 +1147,26 @@ fun ExpenseLedgerApp() {
         if (showInsightsDialog) {
             InsightsDialog(
                 snapshot = snapshot,
+                onUpdateOpeningBalances = { nextBalances ->
+                    persist(snapshot.copy(walletStartingBalances = nextBalances))
+                    showActionSnackbar("Updated wallet opening balances")
+                },
+                onCreateTransfer = { fromMode, toMode, amt, note ->
+                    if (amt > 0.0 && fromMode != toMode) {
+                        val trf = WalletTransferRecord(
+                            fromMode = fromMode,
+                            toMode = toMode,
+                            amount = amt,
+                            note = note.ifBlank { "${fromMode.label} → ${toMode.label} transfer" },
+                            at = LedgerMath.nowIso()
+                        )
+                        persist(snapshot.copy(walletTransfers = listOf(trf) + snapshot.walletTransfers))
+                        showActionSnackbar("Transferred ₹${formatAmount(amt)}")
+                    }
+                },
+                onDeleteTransfer = { trfId ->
+                    persist(snapshot.copy(walletTransfers = snapshot.walletTransfers.filterNot { it.id == trfId }))
+                },
                 onDismiss = { showInsightsDialog = false }
             )
         }
@@ -1011,12 +1203,28 @@ fun ExpenseLedgerApp() {
                 onToggleHideBalances = { hidden ->
                     persist(snapshot.copy(hideBalances = hidden))
                 },
+                onToggleBiometric = { enabled ->
+                    persist(snapshot.copy(biometricEnabled = enabled))
+                },
+                onChangeThemeMode = { nextMode ->
+                    persist(snapshot.copy(themeMode = nextMode))
+                },
+                onToggleDueReminders = { enabled ->
+                    if (enabled && Build.VERSION.SDK_INT >= 33 &&
+                        ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+                    ) {
+                        notifPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+                    } else {
+                        persist(snapshot.copy(dueRemindersEnabled = enabled))
+                        BillDueScheduler.sync(context, enabled)
+                    }
+                },
                 onSetPin = { newPin ->
                     persist(snapshot.copy(privacyPinHash = LedgerMath.sha256Pin(newPin)))
                     showActionSnackbar("4-digit Privacy PIN enabled")
                 },
                 onRemovePin = {
-                    persist(snapshot.copy(privacyPinHash = null))
+                    persist(snapshot.copy(privacyPinHash = null, biometricEnabled = false))
                     isLocked = false
                     showActionSnackbar("Privacy PIN disabled")
                 },
@@ -1049,9 +1257,33 @@ fun ExpenseLedgerApp() {
             )
         }
 
+        if (partialPayTarget != null) {
+            PartialPaymentDialog(
+                expense = partialPayTarget!!,
+                hideBalances = snapshot.hideBalances,
+                onDismiss = { partialPayTarget = null },
+                onConfirm = { amt, mode, note ->
+                    val prev = snapshot
+                    val next = LedgerMath.recordPartialPayment(snapshot, partialPayTarget!!.id, amt, mode, note)
+                    persist(next)
+                    partialPayTarget = null
+                    showActionSnackbar("Recorded ₹${formatAmount(amt)} settlement", prev)
+                }
+            )
+        }
+
+        if (receiptLightboxRecord != null && receiptLightboxRecord!!.receiptAttachment != null) {
+            ReceiptViewerDialog(
+                expense = receiptLightboxRecord!!,
+                onDismiss = { receiptLightboxRecord = null }
+            )
+        }
+
         if (isLocked && !snapshot.privacyPinHash.isNullOrBlank()) {
             PinLockOverlay(
                 pinHash = snapshot.privacyPinHash!!,
+                biometricEnabled = snapshot.biometricEnabled,
+                onBiometricClick = { triggerBiometricAuth(activity) { isLocked = false } },
                 onUnlock = { isLocked = false }
             )
         }
@@ -1091,6 +1323,7 @@ private fun ExpensesScreen(
     statusFilter: ExpenseStatus?,
     entryTypeFilter: EntryType?,
     paymentModeFilter: PaymentMode?,
+    dateWindowFilter: DateWindowFilter,
     pinnedOnlyFilter: Boolean,
     labelFilterId: String?,
     bulkMode: Boolean,
@@ -1100,6 +1333,7 @@ private fun ExpensesScreen(
     onStatusFilterChange: (ExpenseStatus?) -> Unit,
     onEntryTypeFilterChange: (EntryType?) -> Unit,
     onPaymentModeFilterChange: (PaymentMode?) -> Unit,
+    onDateWindowFilterChange: (DateWindowFilter) -> Unit,
     onPinnedOnlyFilterChange: (Boolean) -> Unit,
     onLabelFilterChange: (String?) -> Unit,
     onClearFilters: () -> Unit,
@@ -1113,16 +1347,19 @@ private fun ExpensesScreen(
     onMoveTemplateToBin: (String) -> Unit,
     onCycleStatus: (ExpenseRecord) -> Unit,
     onTogglePin: (ExpenseRecord) -> Unit,
+    onPartialPay: (ExpenseRecord) -> Unit,
+    onViewReceipt: (ExpenseRecord) -> Unit,
     onDuplicate: (ExpenseRecord) -> Unit,
     onEdit: (ExpenseRecord) -> Unit,
     onDelete: (String) -> Unit
 ) {
     val q = searchQuery.trim()
-    val filteredExpenses = remember(expenses, labels, lists, q, statusFilter, entryTypeFilter, paymentModeFilter, pinnedOnlyFilter, labelFilterId) {
+    val filteredExpenses = remember(expenses, labels, lists, q, statusFilter, entryTypeFilter, paymentModeFilter, dateWindowFilter, pinnedOnlyFilter, labelFilterId) {
         expenses.filter { exp ->
             val matchStatus = statusFilter == null || (exp.entryType == EntryType.EXPENSE && exp.status == statusFilter)
             val matchEntryType = entryTypeFilter == null || exp.entryType == entryTypeFilter
             val matchMode = paymentModeFilter == null || exp.paymentMode == paymentModeFilter
+            val matchDate = LedgerMath.filterByDateWindow(exp, dateWindowFilter)
             val matchPin = !pinnedOnlyFilter || exp.isPinned
             val matchLabel = labelFilterId == null || exp.labelIds.contains(labelFilterId)
             val matchSearch = if (q.isBlank()) {
@@ -1139,7 +1376,7 @@ private fun ExpensesScreen(
                     labelHit ||
                     listHit
             }
-            matchStatus && matchEntryType && matchMode && matchPin && matchLabel && matchSearch
+            matchStatus && matchEntryType && matchMode && matchDate && matchPin && matchLabel && matchSearch
         }.sortedByDescending { it.isPinned }
     }
 
@@ -1178,10 +1415,19 @@ private fun ExpensesScreen(
                             label = { Text(if (bulkMode) "Cancel Select" else "Select", fontSize = 11.sp) }
                         )
                         FilterChip(
-                            selected = statusFilter == null && entryTypeFilter == null && paymentModeFilter == null && !pinnedOnlyFilter,
+                            selected = statusFilter == null && entryTypeFilter == null && paymentModeFilter == null && dateWindowFilter == DateWindowFilter.ALL && !pinnedOnlyFilter,
                             onClick = onClearFilters,
                             label = { Text("All (${expenses.size})", fontSize = 11.sp) }
                         )
+                        DateWindowFilter.entries.forEach { dw ->
+                            if (dw != DateWindowFilter.ALL) {
+                                FilterChip(
+                                    selected = dateWindowFilter == dw,
+                                    onClick = { onDateWindowFilterChange(if (dateWindowFilter == dw) DateWindowFilter.ALL else dw) },
+                                    label = { Text(dw.label, fontSize = 11.sp) }
+                                )
+                            }
+                        }
                         FilterChip(
                             selected = pinnedOnlyFilter,
                             onClick = { onPinnedOnlyFilterChange(!pinnedOnlyFilter) },
@@ -1408,6 +1654,60 @@ private fun ExpensesScreen(
 
                         Spacer(Modifier.height(6.dp))
                         Text(exp.quote, style = MaterialTheme.typography.bodyMedium)
+
+                        if (!isIncome && exp.status != ExpenseStatus.PAID) {
+                            val paidPart = LedgerMath.expensePaidPart(exp)
+                            val remPart = LedgerMath.expenseRemainingPart(exp)
+                            val pct = if (exp.balance > 0.0) (paidPart / exp.balance).toFloat().coerceIn(0f, 1f) else 0f
+                            Spacer(Modifier.height(6.dp))
+                            Surface(
+                                shape = RoundedCornerShape(8.dp),
+                                color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.55f),
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Row(
+                                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Column(modifier = Modifier.weight(1f)) {
+                                        Text(
+                                            text = "Paid ₹${LedgerMath.formatDisplayAmt(paidPart, hideBalances)} · Rem ₹${LedgerMath.formatDisplayAmt(remPart, hideBalances)}",
+                                            fontSize = 11.sp,
+                                            fontFamily = FontFamily.Monospace,
+                                            fontWeight = FontWeight.SemiBold
+                                        )
+                                        if (paidPart > 0.0) {
+                                            Spacer(Modifier.height(3.dp))
+                                            LinearProgressIndicator(
+                                                progress = { pct },
+                                                modifier = Modifier.fillMaxWidth().height(4.dp).clip(RoundedCornerShape(4.dp)),
+                                                color = Color(0xFF059669)
+                                            )
+                                        }
+                                    }
+                                    Spacer(Modifier.width(8.dp))
+                                    FilledTonalButton(
+                                        onClick = { onPartialPay(exp) },
+                                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp)
+                                    ) {
+                                        Text("Pay Part", fontSize = 11.sp)
+                                    }
+                                }
+                            }
+                        }
+
+                        if (exp.receiptAttachment != null) {
+                            Spacer(Modifier.height(6.dp))
+                            OutlinedButton(
+                                onClick = { onViewReceipt(exp) },
+                                contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp)
+                            ) {
+                                Icon(Icons.Default.Image, contentDescription = null, modifier = Modifier.size(14.dp))
+                                Spacer(Modifier.width(4.dp))
+                                Text("Receipt: ${exp.receiptAttachment.name}", fontSize = 11.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                            }
+                        }
 
                         Spacer(Modifier.height(6.dp))
                         Row(
@@ -1820,8 +2120,12 @@ private fun ExpenseEditorDialog(
     initialLabelIds: List<String>,
     initialAttachedListIds: List<String>,
     calcFormula: String?,
+    receiptAttachment: ReceiptAttachmentRecord?,
+    expensesHistory: List<ExpenseRecord>,
     labels: List<LabelRecord>,
     lists: List<ListNoteRecord>,
+    onPickReceiptPhoto: () -> Unit,
+    onClearReceiptPhoto: () -> Unit,
     onDismiss: () -> Unit,
     onSave: (Double, String, ExpenseStatus, List<String>, List<String>, Boolean, RecurrenceCycle, EntryType, PaymentMode, Boolean, String) -> Unit
 ) {
@@ -1839,6 +2143,10 @@ private fun ExpenseEditorDialog(
     var showSmsPaste by remember { mutableStateOf(false) }
     var smsInput by remember { mutableStateOf("") }
     var smsFeedback by remember { mutableStateOf<String?>(null) }
+
+    val merchantSuggestions = remember(existing, quoteText, expensesHistory) {
+        if (existing != null) emptyList() else LedgerMath.suggestMerchants(expensesHistory, quoteText, 4)
+    }
 
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -1930,6 +2238,26 @@ private fun ExpenseEditorDialog(
                     onValueChange = { quoteText = it },
                     label = { Text("Quote / Merchant Description") }
                 )
+                if (merchantSuggestions.isNotEmpty()) {
+                    Row(
+                        modifier = Modifier.horizontalScroll(rememberScrollState()),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        merchantSuggestions.forEach { sug ->
+                            SuggestionChip(
+                                onClick = {
+                                    quoteText = sug.quote
+                                    if (balanceText.isBlank()) balanceText = formatAmount(sug.lastBalance)
+                                    paymentMode = sug.paymentMode
+                                    entryType = sug.entryType
+                                    status = sug.status
+                                    selectedLabels = sug.labelIds.toSet()
+                                },
+                                label = { Text("Use: ${sug.quote} · ₹${formatAmount(sug.lastBalance)}", fontSize = 10.sp) }
+                            )
+                        }
+                    }
+                }
                 if (!calcFormula.isNullOrBlank()) {
                     Text(
                         text = "Math Tape: $calcFormula",
@@ -2032,6 +2360,22 @@ private fun ExpenseEditorDialog(
                                 onClick = { recurrence = cycle },
                                 label = { Text(cycle.label, fontSize = 11.sp) }
                             )
+                        }
+                    }
+                }
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    OutlinedButton(onClick = onPickReceiptPhoto) {
+                        Icon(Icons.Default.PhotoCamera, contentDescription = null, modifier = Modifier.size(15.dp))
+                        Spacer(Modifier.width(4.dp))
+                        Text(if (receiptAttachment == null) "Attach Receipt" else "Replace Receipt", fontSize = 11.sp)
+                    }
+                    if (receiptAttachment != null) {
+                        TextButton(onClick = onClearReceiptPhoto) {
+                            Text("Remove (${receiptAttachment.name.take(14)})", fontSize = 10.sp, color = Color(0xFFDC2626))
                         }
                     }
                 }
@@ -2361,6 +2705,7 @@ private fun ShareSummaryDialog(
     onDismiss: () -> Unit,
     onExportCsv: () -> Unit,
     onImportCsv: () -> Unit,
+    onExportPdf: (String?, String?) -> Unit,
     onShareText: (String) -> Unit
 ) {
     var selectedLabelId by remember(initialLabelId) { mutableStateOf(initialLabelId) }
@@ -2440,6 +2785,14 @@ private fun ShareSummaryDialog(
                         Text("Import CSV", fontSize = 11.sp)
                     }
                 }
+                OutlinedButton(
+                    onClick = { onExportPdf(selectedLabelId, selectedMonthKey) },
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Icon(Icons.Default.PictureAsPdf, contentDescription = null, modifier = Modifier.size(15.dp))
+                    Spacer(Modifier.width(6.dp))
+                    Text("Save PDF Statement (.pdf)", fontSize = 11.sp)
+                }
             }
         },
         confirmButton = {
@@ -2458,6 +2811,9 @@ private fun ShareSummaryDialog(
 @Composable
 private fun InsightsDialog(
     snapshot: LedgerSnapshot,
+    onUpdateOpeningBalances: (Map<PaymentMode, Double>) -> Unit,
+    onCreateTransfer: (PaymentMode, PaymentMode, Double, String) -> Unit,
+    onDeleteTransfer: (String) -> Unit,
     onDismiss: () -> Unit
 ) {
     val initialMonth = remember(snapshot.expenses) {
@@ -2466,6 +2822,17 @@ private fun InsightsDialog(
     var monthKey by remember { mutableStateOf(initialMonth) }
     var activeSection by remember { mutableStateOf(0) } // 0 = Budgets, 1 = Cashflow, 2 = Merchants, 3 = Calendar
     var selectedDateKey by remember { mutableStateOf<String?>(null) }
+    var showOpeningEditor by remember { mutableStateOf(false) }
+    var showTransferForm by remember { mutableStateOf(false) }
+    var trfFrom by remember { mutableStateOf(PaymentMode.BANK) }
+    var trfTo by remember { mutableStateOf(PaymentMode.UPI) }
+    var trfAmtText by remember { mutableStateOf("") }
+    var trfNote by remember { mutableStateOf("") }
+
+    var startUpi by remember(snapshot.walletStartingBalances) { mutableStateOf(formatAmount(snapshot.walletStartingBalances[PaymentMode.UPI] ?: 0.0)) }
+    var startCash by remember(snapshot.walletStartingBalances) { mutableStateOf(formatAmount(snapshot.walletStartingBalances[PaymentMode.CASH] ?: 0.0)) }
+    var startCard by remember(snapshot.walletStartingBalances) { mutableStateOf(formatAmount(snapshot.walletStartingBalances[PaymentMode.CARD] ?: 0.0)) }
+    var startBank by remember(snapshot.walletStartingBalances) { mutableStateOf(formatAmount(snapshot.walletStartingBalances[PaymentMode.BANK] ?: 0.0)) }
 
     val hideBalances = snapshot.hideBalances
     val monthExpenses = remember(snapshot.expenses, monthKey) {
@@ -2477,6 +2844,9 @@ private fun InsightsDialog(
     }
     val wallets = remember(snapshot.expenses, monthKey) {
         LedgerMath.computeWalletBreakdown(snapshot.expenses, monthKey)
+    }
+    val liveWallets = remember(snapshot) {
+        LedgerMath.computeLiveWalletBalances(snapshot)
     }
     val merchants = remember(snapshot.expenses, monthKey) {
         LedgerMath.computeMerchantInsights(snapshot.expenses, monthKey)
@@ -2592,7 +2962,101 @@ private fun InsightsDialog(
                                 )
                             }
                         }
-                        Text("Wallets & Payment Modes", fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                            Text("Live Wallet Balances", fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                            Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                                OutlinedButton(
+                                    onClick = { showOpeningEditor = !showOpeningEditor; showTransferForm = false },
+                                    contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp)
+                                ) { Text("Opening", fontSize = 10.sp) }
+                                FilledTonalButton(
+                                    onClick = { showTransferForm = !showTransferForm; showOpeningEditor = false },
+                                    contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp)
+                                ) { Text("Transfer", fontSize = 10.sp) }
+                            }
+                        }
+                        liveWallets.forEach { lw ->
+                            Surface(
+                                shape = RoundedCornerShape(8.dp),
+                                color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.45f),
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Row(
+                                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp),
+                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Column {
+                                        Text(lw.mode.label, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                                        Text("Open ₹${LedgerMath.formatDisplayAmt(lw.startingBalance, hideBalances)} · Out -₹${LedgerMath.formatDisplayAmt(lw.cashOutflow, hideBalances)}", fontSize = 10.sp, fontFamily = FontFamily.Monospace)
+                                    }
+                                    Text(
+                                        text = "₹${LedgerMath.formatDisplayAmt(lw.liveBalance, hideBalances)}",
+                                        fontSize = 13.sp,
+                                        fontWeight = FontWeight.Bold,
+                                        fontFamily = FontFamily.Monospace
+                                    )
+                                }
+                            }
+                        }
+                        if (showOpeningEditor) {
+                            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                                OutlinedTextField(value = startUpi, onValueChange = { startUpi = it }, label = { Text("UPI Opening (₹)") }, singleLine = true, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal))
+                                OutlinedTextField(value = startCash, onValueChange = { startCash = it }, label = { Text("Cash Opening (₹)") }, singleLine = true, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal))
+                                OutlinedTextField(value = startCard, onValueChange = { startCard = it }, label = { Text("Card Opening (₹)") }, singleLine = true, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal))
+                                OutlinedTextField(value = startBank, onValueChange = { startBank = it }, label = { Text("Bank Opening (₹)") }, singleLine = true, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal))
+                                Button(
+                                    onClick = {
+                                        onUpdateOpeningBalances(
+                                            mapOf(
+                                                PaymentMode.UPI to (startUpi.toDoubleOrNull() ?: 0.0),
+                                                PaymentMode.CASH to (startCash.toDoubleOrNull() ?: 0.0),
+                                                PaymentMode.CARD to (startCard.toDoubleOrNull() ?: 0.0),
+                                                PaymentMode.BANK to (startBank.toDoubleOrNull() ?: 0.0)
+                                            )
+                                        )
+                                        showOpeningEditor = false
+                                    }
+                                ) { Text("Save Opening Balances", fontSize = 11.sp) }
+                            }
+                        }
+                        if (showTransferForm) {
+                            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                                Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                                    PaymentMode.entries.forEach { m ->
+                                        FilterChip(selected = trfFrom == m, onClick = { trfFrom = m }, label = { Text("From " + m.label, fontSize = 9.sp) })
+                                    }
+                                }
+                                Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                                    PaymentMode.entries.forEach { m ->
+                                        FilterChip(selected = trfTo == m, onClick = { trfTo = m }, label = { Text("To " + m.label, fontSize = 9.sp) })
+                                    }
+                                }
+                                OutlinedTextField(value = trfAmtText, onValueChange = { trfAmtText = it }, label = { Text("Transfer Amount (₹)") }, singleLine = true, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal))
+                                OutlinedTextField(value = trfNote, onValueChange = { trfNote = it }, label = { Text("Note (Optional)") }, singleLine = true)
+                                Button(
+                                    onClick = {
+                                        val amt = trfAmtText.toDoubleOrNull() ?: 0.0
+                                        if (amt > 0.0 && trfFrom != trfTo) {
+                                            onCreateTransfer(trfFrom, trfTo, amt, trfNote)
+                                            trfAmtText = ""
+                                            trfNote = ""
+                                            showTransferForm = false
+                                        }
+                                    }
+                                ) { Text("Record Transfer", fontSize = 11.sp) }
+                            }
+                        }
+                        if (snapshot.walletTransfers.isNotEmpty()) {
+                            Text("Recent Transfers", fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                            snapshot.walletTransfers.take(5).forEach { trf ->
+                                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                                    Text("${trf.fromMode.label} → ${trf.toMode.label} · ₹${LedgerMath.formatDisplayAmt(trf.amount, hideBalances)}", fontSize = 11.sp, fontFamily = FontFamily.Monospace)
+                                    TextButton(onClick = { onDeleteTransfer(trf.id) }) { Text("Delete", fontSize = 10.sp, color = Color(0xFFDC2626)) }
+                                }
+                            }
+                        }
+                        Text("Monthly Spend Breakdown", fontSize = 12.sp, fontWeight = FontWeight.Bold)
                         wallets.forEach { w ->
                             Column(verticalArrangement = Arrangement.spacedBy(3.dp)) {
                                 Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
@@ -2831,6 +3295,9 @@ private fun PrivacyPinDialog(
     snapshot: LedgerSnapshot,
     onDismiss: () -> Unit,
     onToggleHideBalances: (Boolean) -> Unit,
+    onToggleBiometric: (Boolean) -> Unit,
+    onChangeThemeMode: (ThemeMode) -> Unit,
+    onToggleDueReminders: (Boolean) -> Unit,
     onSetPin: (String) -> Unit,
     onRemovePin: () -> Unit,
     onLockNow: () -> Unit
@@ -2843,7 +3310,7 @@ private fun PrivacyPinDialog(
 
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text("Privacy & App Lock") },
+        title = { Text("Privacy & Preferences") },
         text = {
             Column(
                 modifier = Modifier.verticalScroll(rememberScrollState()),
@@ -2861,10 +3328,44 @@ private fun PrivacyPinDialog(
                     Switch(checked = snapshot.hideBalances, onCheckedChange = onToggleHideBalances)
                 }
 
+                Text("App Theme Mode", fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    ThemeMode.entries.forEach { mode ->
+                        FilterChip(
+                            selected = snapshot.themeMode == mode,
+                            onClick = { onChangeThemeMode(mode) },
+                            label = { Text(mode.label, fontSize = 11.sp) }
+                        )
+                    }
+                }
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text("Daily Due Bill Reminders", fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+                        Text("WorkManager local alerts for unpaid bills", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                    Switch(checked = snapshot.dueRemindersEnabled, onCheckedChange = onToggleDueReminders)
+                }
+
                 HorizontalDivider()
 
                 if (hasPin) {
                     Text("4-Digit PIN Lock Active", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = Color(0xFF059669))
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text("Biometric Unlock", fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+                            Text("Fingerprint / Face via BiometricPrompt", fontSize = 10.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        }
+                        Switch(checked = snapshot.biometricEnabled, onCheckedChange = onToggleBiometric)
+                    }
                     OutlinedTextField(
                         value = currentPin,
                         onValueChange = { if (it.length <= 4) currentPin = it.filter { c -> c.isDigit() } },
@@ -3023,8 +3524,121 @@ private fun CsvImportDialog(
 }
 
 @Composable
+private fun PartialPaymentDialog(
+    expense: ExpenseRecord,
+    hideBalances: Boolean,
+    onDismiss: () -> Unit,
+    onConfirm: (Double, PaymentMode, String) -> Unit
+) {
+    val alreadyPaid = LedgerMath.expensePaidPart(expense)
+    val remaining = LedgerMath.expenseRemainingPart(expense)
+    var amtText by remember { mutableStateOf(formatAmount(remaining)) }
+    var mode by remember { mutableStateOf(expense.paymentMode) }
+    var note by remember { mutableStateOf("") }
+    var error by remember { mutableStateOf<String?>(null) }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Pay Part — ${expense.status.label} Bill") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text(expense.quote, fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
+                Text(
+                    text = "Paid ₹${LedgerMath.formatDisplayAmt(alreadyPaid, hideBalances)} · Left ₹${LedgerMath.formatDisplayAmt(remaining, hideBalances)}",
+                    fontSize = 11.sp,
+                    fontFamily = FontFamily.Monospace
+                )
+                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    listOf("25%" to 0.25, "50%" to 0.50, "Full" to 1.0).forEach { (lbl, factor) ->
+                        OutlinedButton(
+                            onClick = {
+                                amtText = formatAmount(kotlin.math.round(remaining * factor * 100.0) / 100.0)
+                                error = null
+                            },
+                            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp)
+                        ) { Text(lbl, fontSize = 11.sp) }
+                    }
+                }
+                OutlinedTextField(
+                    value = amtText,
+                    onValueChange = { amtText = it; error = null },
+                    label = { Text("Amount (₹)") },
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+                    singleLine = true
+                )
+                Row(
+                    modifier = Modifier.horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    PaymentMode.entries.forEach { m ->
+                        FilterChip(selected = mode == m, onClick = { mode = m }, label = { Text(m.label, fontSize = 11.sp) })
+                    }
+                }
+                OutlinedTextField(value = note, onValueChange = { note = it }, label = { Text("Note (Optional)") }, singleLine = true)
+                if (!error.isNullOrBlank()) {
+                    Text(error!!, fontSize = 11.sp, color = Color(0xFFDC2626))
+                }
+            }
+        },
+        confirmButton = {
+            Button(onClick = {
+                val amt = amtText.toDoubleOrNull() ?: 0.0
+                if (amt <= 0.0 || amt > remaining + 0.01) {
+                    error = "Enter an amount between ₹1 and ₹${formatAmount(remaining)}."
+                } else {
+                    onConfirm(amt, mode, note)
+                }
+            }) { Text("Confirm Pay") }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("Cancel") }
+        }
+    )
+}
+
+@Composable
+private fun ReceiptViewerDialog(
+    expense: ExpenseRecord,
+    onDismiss: () -> Unit
+) {
+    val context = LocalContext.current
+    val att = expense.receiptAttachment
+    val bitmap = remember(att?.uriOrDataUrl) {
+        if (att == null) null
+        else try {
+            context.contentResolver.openInputStream(Uri.parse(att.uriOrDataUrl))?.use { stream ->
+                BitmapFactory.decodeStream(stream)?.asImageBitmap()
+            }
+        } catch (_: Exception) {
+            null
+        }
+    }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(expense.quote, maxLines = 1, overflow = TextOverflow.Ellipsis) },
+        text = {
+            if (bitmap != null) {
+                Image(
+                    bitmap = bitmap,
+                    contentDescription = att?.name ?: "Receipt photo",
+                    contentScale = ContentScale.Fit,
+                    modifier = Modifier.fillMaxWidth().heightIn(max = 320.dp).clip(RoundedCornerShape(10.dp))
+                )
+            } else {
+                Text("Receipt URI: ${att?.name ?: "Unavailable"}", fontSize = 12.sp)
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = onDismiss) { Text("Close") }
+        }
+    )
+}
+
+@Composable
 private fun PinLockOverlay(
     pinHash: String,
+    biometricEnabled: Boolean,
+    onBiometricClick: () -> Unit,
     onUnlock: () -> Unit
 ) {
     var entered by remember { mutableStateOf("") }
@@ -3101,6 +3715,14 @@ private fun PinLockOverlay(
                             }
                         }
                     }
+                }
+            }
+            if (biometricEnabled) {
+                Spacer(Modifier.height(16.dp))
+                FilledTonalButton(onClick = onBiometricClick) {
+                    Icon(Icons.Default.Fingerprint, contentDescription = null, modifier = Modifier.size(18.dp))
+                    Spacer(Modifier.width(6.dp))
+                    Text("Unlock with Biometrics", fontSize = 12.sp)
                 }
             }
         }
