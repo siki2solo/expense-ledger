@@ -1,15 +1,14 @@
 # Expense Ledger (Android)
 
 Package ID: `com.example.expenseledger`
-Version: `1.4` (Code `5`)
+Version: `1.5` (Code `6`)
 
 ## Features Included
 - **Live Balance Dashboard**: Isolated `PAID (₹)`, `HOLD (₹)`, `NEED (₹)`, and Grand Commitment calculated strictly from active Expenses (with partial settlements credited live to `PAID`), plus Net Cashflow indicator when Income entries exist.
-- **Partial Payments on Hold & Need Bills (v1.4)**: Record inline `Pay Part` settlements with `25% / 50% / Full` presets and wallet tracking without double-counting totals.
-- **Live Wallet Balances & Transfers (v1.4)**: Opening balances per wallet (`UPI / Cash / Card / Bank`) plus internal transfers inside `Insights → Cashflow`.
-- **Biometric Unlock & Persistent Theme Mode (v1.4)**: Android `BiometricPrompt` (`FragmentActivity`) alongside SHA-256 4-digit PIN lock and persistent `System | Light | Dark` theme preference.
-- **Date-Range Filter, Merchant Auto-Suggest & PDF Export (v1.4)**: `Today / 7D / Month` chips, historical merchant suggestions, and formatted multi-page `PdfDocument` statement export (`.pdf`).
-- **Receipt Photo Attachments (v1.4)**: Scoped Android Photo Picker (`PickVisualMedia`, zero storage permissions required) with inline receipt viewer.
-- **Home Screen Shortcuts & Due Bill Reminders (v1.4)**: Static launcher shortcuts (`new_expense`, `quick_calc`, `insights`) and `WorkManager` daily due alerts (`BillDueWorker`).
-- **Wallets, Smart Paste SMS, Pinned/Due Dates, CSV Import/Export, 4-Tab Insights, Recycle Bin, Bulk Select, Templates & Calculator**.
+- **1-Click International Calendar & .ics Export (v1.5)**: Direct header & launcher shortcut calendar with configurable `Mon ISO | Sun | Sat` week start, ISO week numbers (`W01–W53`), 7 regional holiday packs (`Global / IN / US / UK / EU / AE / JP`), RFC 5545 `.ics` export, and unified Day Agenda (`+ Log on Date`, `Filter Feed`, `Pay Part`, recurring `Log Now`, transfers, IOU repayments, and goal targets).
+- **Home Screen Glance Balance Widget (v1.5)**: Jetpack Glance widget (`BalanceWidget.kt`) showing live `PAID`, `HOLD`, `NEED`, `Net`, and direct `+ Expense` & `Calendar` deep links.
+- **AES-256-GCM Encrypted Backups & Auto-Lock (v1.5)**: Cross-platform `.ebak` archive encryption (PBKDF2-HMAC-SHA256 100k rounds + AES-256-GCM) plus background lifecycle Auto-Lock timeout (`Off / 30s / 1m / 5m`).
+- **Auto-Label Rules, 30-Day Cashflow Forecast, Split Bills / IOUs & Savings Goals (v1.5)**: Keyword rules in Entry/SMS/CSV, 30-day liquidity projection, friend IOU settlement crediting the chosen Wallet, and target Savings Goal jars inside `Insights`.
+- **Partial Payments, Live Wallet Balances & Transfers, Biometrics, Dark Mode, Receipt Photo Picker & PDF Export (v1.4)**.
+- **Wallets, Smart Paste SMS, Pinned/Due Dates, CSV Import/Export, Recycle Bin, Bulk Select, Templates & Calculator**.
 - **Persistent SQLite + JSON Storage** (`LedgerStorage.kt`) & **GitHub Actions Signed APK CI/CD** (`.github/workflows/build-apk.yml`).

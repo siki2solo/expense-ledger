@@ -14,6 +14,19 @@
         </intent>
     </shortcut>
     <shortcut
+        android:shortcutId="calendar"
+        android:enabled="true"
+        android:icon="@mipmap/ic_launcher"
+        android:shortcutShortLabel="@string/shortcut_calendar_short"
+        android:shortcutLongLabel="@string/shortcut_calendar_long">
+        <intent
+            android:action="android.intent.action.VIEW"
+            android:targetPackage="com.example.expenseledger"
+            android:targetClass="com.example.expenseledger.MainActivity">
+            <extra android:name="shortcut_action" android:value="calendar" />
+        </intent>
+    </shortcut>
+    <shortcut
         android:shortcutId="quick_calc"
         android:enabled="true"
         android:icon="@mipmap/ic_launcher"

@@ -7,15 +7,22 @@ import android.database.sqlite.SQLiteOpenHelper
 import android.graphics.Paint
 import android.graphics.pdf.PdfDocument
 import android.net.Uri
+import android.util.Base64
 import org.json.JSONArray
 import org.json.JSONObject
 import java.security.MessageDigest
+import java.security.SecureRandom
 import java.text.SimpleDateFormat
 import java.util.Calendar
 import java.util.Date
 import java.util.Locale
 import java.util.TimeZone
 import java.util.UUID
+import javax.crypto.Cipher
+import javax.crypto.SecretKeyFactory
+import javax.crypto.spec.GCMParameterSpec
+import javax.crypto.spec.PBEKeySpec
+import javax.crypto.spec.SecretKeySpec
 
 enum class ExpenseStatus(val label: String) {
     PAID("Paid"),
@@ -97,6 +104,117 @@ enum class DateWindowFilter(val label: String) {
     MONTH("Month")
 }
 
+enum class CalendarWeekStart(val key: String, val label: String) {
+    MON("mon", "Mon ISO"),
+    SUN("sun", "Sun"),
+    SAT("sat", "Sat");
+
+    companion object {
+        fun fromKey(value: String): CalendarWeekStart =
+            entries.firstOrNull { it.key.equals(value, ignoreCase = true) } ?: MON
+    }
+}
+
+enum class CalendarRegionCode(val key: String, val label: String) {
+    GLOBAL("global", "Global UN"),
+    IN("in", "India (IN)"),
+    US("us", "United States (US)"),
+    UK("uk", "United Kingdom (UK)"),
+    EU("eu", "Eurozone (EU)"),
+    AE("ae", "UAE (AE)"),
+    JP("jp", "Japan (JP)");
+
+    companion object {
+        fun fromKey(value: String): CalendarRegionCode =
+            entries.firstOrNull { it.key.equals(value, ignoreCase = true) } ?: IN
+    }
+}
+
+data class CalendarPreferences(
+    val weekStart: CalendarWeekStart = CalendarWeekStart.MON,
+    val showIsoWeeks: Boolean = true,
+    val region: CalendarRegionCode = CalendarRegionCode.IN
+)
+
+data class InternationalHoliday(
+    val dateKey: String,
+    val name: String,
+    val region: CalendarRegionCode
+)
+
+data class AutoLabelRule(
+    val id: String = "rule-" + UUID.randomUUID().toString().take(8),
+    val keyword: String,
+    val labelIds: List<String> = emptyList(),
+    val defaultPaymentMode: PaymentMode? = null,
+    val enabled: Boolean = true
+)
+
+data class ExpenseSplitShare(
+    val id: String = "sp-" + UUID.randomUUID().toString().take(8),
+    val friendName: String,
+    val amount: Double
+)
+
+data class IouRepaymentRecord(
+    val id: String = "rep-" + UUID.randomUUID().toString().take(8),
+    val friendName: String,
+    val amount: Double,
+    val walletMode: PaymentMode,
+    val at: String,
+    val note: String = ""
+)
+
+data class FriendIouSummary(
+    val friendName: String,
+    val totalShared: Double,
+    val totalRepaid: Double,
+    val outstanding: Double,
+    val itemCount: Int
+)
+
+data class SavingsGoalItem(
+    val id: String = "goal-" + UUID.randomUUID().toString().take(8),
+    val title: String,
+    val targetAmount: Double,
+    val targetDate: String? = null,
+    val monthlyTarget: Double? = null,
+    val colorHex: String = "#059669",
+    val createdAt: String
+)
+
+data class GoalTransaction(
+    val id: String = "gtx-" + UUID.randomUUID().toString().take(8),
+    val goalId: String,
+    val kind: String, // "deposit" or "withdraw"
+    val amount: Double,
+    val walletMode: PaymentMode,
+    val at: String,
+    val note: String = ""
+)
+
+data class GoalProgressSummary(
+    val goal: SavingsGoalItem,
+    val savedAmount: Double,
+    val pct: Int,
+    val remaining: Double
+)
+
+data class ForecastItem(
+    val dateKey: String,
+    val title: String,
+    val amount: Double,
+    val kind: String // "due" or "recurring"
+)
+
+data class CashflowForecast30d(
+    val liquidCash: Double,
+    val projectedOutflow: Double,
+    val projectedBalance: Double,
+    val shortfallAmount: Double,
+    val items: List<ForecastItem>
+)
+
 data class AuditEntry(
     val id: String = UUID.randomUUID().toString(),
     val action: String, // "Created" or "Updated"
@@ -165,7 +283,8 @@ data class ExpenseRecord(
     val dueDate: String? = null,
     val paidAmount: Double = 0.0,
     val partialPayments: List<PartialPaymentRecord> = emptyList(),
-    val receiptAttachment: ReceiptAttachmentRecord? = null
+    val receiptAttachment: ReceiptAttachmentRecord? = null,
+    val splitShares: List<ExpenseSplitShare> = emptyList()
 )
 
 data class CalcHistoryRecord(
@@ -214,7 +333,13 @@ data class LedgerSnapshot(
     val themeMode: ThemeMode = ThemeMode.SYSTEM,
     val dueRemindersEnabled: Boolean = true,
     val walletStartingBalances: Map<PaymentMode, Double> = emptyMap(),
-    val walletTransfers: List<WalletTransferRecord> = emptyList()
+    val walletTransfers: List<WalletTransferRecord> = emptyList(),
+    val calendarPrefs: CalendarPreferences = CalendarPreferences(),
+    val autoLabelRules: List<AutoLabelRule> = emptyList(),
+    val iouRepayments: List<IouRepaymentRecord> = emptyList(),
+    val savingsGoals: List<SavingsGoalItem> = emptyList(),
+    val goalTransactions: List<GoalTransaction> = emptyList(),
+    val autoLockSeconds: Int = 0
 )
 
 data class CalendarDayCell(
@@ -222,6 +347,31 @@ data class CalendarDayCell(
     val day: Int,
     val total: Double,
     val expenses: List<ExpenseRecord>
+)
+
+data class InternationalCalendarDayCell(
+    val dateKey: String,
+    val day: Int,
+    val expenseTotal: Double,
+    val incomeTotal: Double,
+    val expenses: List<ExpenseRecord>,
+    val dueBills: List<ExpenseRecord>,
+    val projectedTemplates: List<ExpenseTemplateRecord>,
+    val holidays: List<InternationalHoliday>,
+    val transfers: List<WalletTransferRecord>,
+    val repayments: List<IouRepaymentRecord>,
+    val goalTargets: List<SavingsGoalItem>
+)
+
+data class InternationalCalendarMonth(
+    val monthKey: String,
+    val leadingBlanks: Int,
+    val daysInMonth: Int,
+    val weekHeaders: List<String>,
+    val rowWeekNumbers: List<Int>,
+    val cells: List<InternationalCalendarDayCell>,
+    val monthExpenseTotal: Double,
+    val monthIncomeTotal: Double
 )
 
 data class CashflowSummary(
@@ -249,6 +399,7 @@ data class LiveWalletBalanceRow(
     val cashOutflow: Double,
     val transfersIn: Double,
     val transfersOut: Double,
+    val repaymentsIn: Double,
     val liveBalance: Double
 )
 
@@ -525,12 +676,20 @@ object LedgerMath {
             }
         }
 
+        val repInMap = PaymentMode.entries.associateWith { 0.0 }.toMutableMap()
+        snapshot.iouRepayments.forEach { rep ->
+            if (rep.amount > 0.0) {
+                repInMap[rep.walletMode] = (repInMap[rep.walletMode] ?: 0.0) + rep.amount
+            }
+        }
+
         return PaymentMode.entries.map { mode ->
             val startBal = snapshot.walletStartingBalances[mode] ?: 0.0
             val inc = incomeMap[mode] ?: 0.0
             val out = outflowMap[mode] ?: 0.0
             val tIn = tInMap[mode] ?: 0.0
             val tOut = tOutMap[mode] ?: 0.0
+            val rIn = repInMap[mode] ?: 0.0
             LiveWalletBalanceRow(
                 mode = mode,
                 startingBalance = startBal,
@@ -538,8 +697,353 @@ object LedgerMath {
                 cashOutflow = out,
                 transfersIn = tIn,
                 transfersOut = tOut,
-                liveBalance = kotlin.math.round((startBal + inc - out - tOut + tIn) * 100.0) / 100.0
+                repaymentsIn = rIn,
+                liveBalance = kotlin.math.round((startBal + inc + rIn - out - tOut + tIn) * 100.0) / 100.0
             )
+        }
+    }
+
+    fun getIsoWeekNumber(dateKey: String): Int {
+        return try {
+            val parts = dateKey.split("-")
+            val cal = Calendar.getInstance(TimeZone.getTimeZone("UTC"))
+            cal.firstDayOfWeek = Calendar.MONDAY
+            cal.minimalDaysInFirstWeek = 4
+            cal.set(parts[0].toInt(), parts[1].toInt() - 1, parts[2].toInt(), 0, 0, 0)
+            cal.get(Calendar.WEEK_OF_YEAR)
+        } catch (_: Exception) {
+            1
+        }
+    }
+
+    fun getInternationalHolidaysForMonth(monthKey: String, region: CalendarRegionCode): List<InternationalHoliday> {
+        val parts = monthKey.split("-")
+        val year = parts.getOrNull(0) ?: return emptyList()
+        val m = parts.getOrNull(1)?.toIntOrNull() ?: return emptyList()
+        val fixed = mutableListOf<Triple<String, String, CalendarRegionCode>>()
+        when (m) {
+            1 -> {
+                fixed.add(Triple("$year-01-01", "New Year's Day", CalendarRegionCode.GLOBAL))
+                fixed.add(Triple("$year-01-26", "Republic Day", CalendarRegionCode.IN))
+            }
+            2 -> fixed.add(Triple("$year-02-11", "National Foundation Day", CalendarRegionCode.JP))
+            5 -> {
+                fixed.add(Triple("$year-05-01", "Labour Day", CalendarRegionCode.GLOBAL))
+                fixed.add(Triple("$year-05-09", "Europe Day", CalendarRegionCode.EU))
+            }
+            7 -> fixed.add(Triple("$year-07-04", "Independence Day", CalendarRegionCode.US))
+            8 -> {
+                fixed.add(Triple("$year-08-15", "Independence Day", CalendarRegionCode.IN))
+                fixed.add(Triple("$year-08-11", "Mountain Day", CalendarRegionCode.JP))
+            }
+            10 -> {
+                fixed.add(Triple("$year-10-02", "Gandhi Jayanti", CalendarRegionCode.IN))
+                fixed.add(Triple("$year-10-31", "World Cities Day", CalendarRegionCode.GLOBAL))
+            }
+            11 -> {
+                fixed.add(Triple("$year-11-01", "All Saints' Day", CalendarRegionCode.EU))
+                fixed.add(Triple("$year-11-11", "Veterans Day", CalendarRegionCode.US))
+                fixed.add(Triple("$year-11-23", "Labor Thanksgiving", CalendarRegionCode.JP))
+                fixed.add(Triple("$year-11-30", "Commemoration Day", CalendarRegionCode.AE))
+            }
+            12 -> {
+                fixed.add(Triple("$year-12-02", "UAE National Day", CalendarRegionCode.AE))
+                fixed.add(Triple("$year-12-25", "Christmas Day", CalendarRegionCode.GLOBAL))
+                fixed.add(Triple("$year-12-26", "Boxing Day", CalendarRegionCode.UK))
+            }
+        }
+        return fixed
+            .filter { it.third == CalendarRegionCode.GLOBAL || it.third == region }
+            .map { InternationalHoliday(it.first, it.second, it.third) }
+    }
+
+    fun buildInternationalCalendarMonth(
+        snapshot: LedgerSnapshot,
+        monthKey: String,
+        prefs: CalendarPreferences = snapshot.calendarPrefs
+    ): InternationalCalendarMonth {
+        val parts = monthKey.split("-")
+        val year = parts.getOrNull(0)?.toIntOrNull() ?: 2026
+        val month = (parts.getOrNull(1)?.toIntOrNull() ?: 11) - 1
+        val cal = Calendar.getInstance(TimeZone.getTimeZone("UTC"))
+        cal.set(year, month, 1, 0, 0, 0)
+        val daysInMonth = cal.getActualMaximum(Calendar.DAY_OF_MONTH)
+        val dowSun0 = cal.get(Calendar.DAY_OF_WEEK) - 1 // Sun=0..Sat=6
+        val firstOffset = when (prefs.weekStart) {
+            CalendarWeekStart.SUN -> dowSun0
+            CalendarWeekStart.SAT -> (dowSun0 + 1) % 7
+            CalendarWeekStart.MON -> (dowSun0 + 6) % 7
+        }
+        val headers = when (prefs.weekStart) {
+            CalendarWeekStart.SUN -> listOf("Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat")
+            CalendarWeekStart.SAT -> listOf("Sat", "Sun", "Mon", "Tue", "Wed", "Thu", "Fri")
+            CalendarWeekStart.MON -> listOf("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+        }
+        val holidays = getInternationalHolidaysForMonth(monthKey, prefs.region)
+        var monthExp = 0.0
+        var monthInc = 0.0
+        val cells = (1..daysInMonth).map { day ->
+            val dateKey = String.format(Locale.US, "%s-%02d", monthKey, day)
+            val dayEntries = snapshot.expenses.filter { it.createdAt.startsWith(dateKey) }
+            val dayExp = dayEntries.filter { it.entryType == EntryType.EXPENSE }.sumOf { it.balance }
+            val dayInc = dayEntries.filter { it.entryType == EntryType.INCOME }.sumOf { it.balance }
+            monthExp += dayExp
+            monthInc += dayInc
+            val dueBills = snapshot.expenses.filter {
+                it.entryType == EntryType.EXPENSE && it.status != ExpenseStatus.PAID && it.dueDate == dateKey
+            }
+            val projected = snapshot.templates.filter { tpl ->
+                when (tpl.recurrence) {
+                    RecurrenceCycle.MONTHLY -> {
+                        val anchorDay = (tpl.lastUsedAt ?: tpl.createdAt).drop(8).take(2).toIntOrNull() ?: 1
+                        day == minOf(anchorDay, daysInMonth)
+                    }
+                    RecurrenceCycle.WEEKLY -> day % 7 == 1
+                    RecurrenceCycle.NONE -> false
+                }
+            }
+            InternationalCalendarDayCell(
+                dateKey = dateKey,
+                day = day,
+                expenseTotal = dayExp,
+                incomeTotal = dayInc,
+                expenses = dayEntries,
+                dueBills = dueBills,
+                projectedTemplates = projected,
+                holidays = holidays.filter { it.dateKey == dateKey },
+                transfers = snapshot.walletTransfers.filter { it.at.startsWith(dateKey) },
+                repayments = snapshot.iouRepayments.filter { it.at.startsWith(dateKey) },
+                goalTargets = snapshot.savingsGoals.filter { it.targetDate == dateKey }
+            )
+        }
+        val rowCount = (firstOffset + cells.size + 6) / 7
+        val weekNumbers = (0 until rowCount).map { row ->
+            val firstDayIdx = (row * 7 - firstOffset).coerceIn(0, (cells.size - 1).coerceAtLeast(0))
+            getIsoWeekNumber(cells[firstDayIdx].dateKey)
+        }
+        return InternationalCalendarMonth(
+            monthKey = monthKey,
+            leadingBlanks = firstOffset,
+            daysInMonth = daysInMonth,
+            weekHeaders = headers,
+            rowWeekNumbers = weekNumbers,
+            cells = cells,
+            monthExpenseTotal = monthExp,
+            monthIncomeTotal = monthInc
+        )
+    }
+
+    fun generateBillsIcsCalendar(snapshot: LedgerSnapshot, appName: String): String {
+        return buildString {
+            appendLine("BEGIN:VCALENDAR")
+            appendLine("VERSION:2.0")
+            appendLine("PRODID:-//$appName//International Ledger//EN")
+            snapshot.expenses.filter { !it.dueDate.isNullOrBlank() && it.entryType == EntryType.EXPENSE }.forEach { exp ->
+                val dt = exp.dueDate!!.replace("-", "")
+                appendLine("BEGIN:VEVENT")
+                appendLine("UID:${exp.id}@expenseledger")
+                appendLine("DTSTART;VALUE=DATE:$dt")
+                appendLine("SUMMARY:${exp.quote} (₹${formatAmt(exp.balance)})")
+                appendLine("DESCRIPTION:Status: ${exp.status.label} · Mode: ${exp.paymentMode.label}")
+                appendLine("END:VEVENT")
+            }
+            snapshot.savingsGoals.filter { !it.targetDate.isNullOrBlank() }.forEach { goal ->
+                val dt = goal.targetDate!!.replace("-", "")
+                appendLine("BEGIN:VEVENT")
+                appendLine("UID:${goal.id}@expenseledger")
+                appendLine("DTSTART;VALUE=DATE:$dt")
+                appendLine("SUMMARY:Goal: ${goal.title} (Target ₹${formatAmt(goal.targetAmount)})")
+                appendLine("END:VEVENT")
+            }
+            appendLine("END:VCALENDAR")
+        }
+    }
+
+    fun applyAutoLabelRules(
+        text: String,
+        rules: List<AutoLabelRule>,
+        existingLabelIds: List<String>,
+        currentMode: PaymentMode
+    ): Pair<List<String>, PaymentMode> {
+        val hay = text.trim().lowercase(Locale.US)
+        if (hay.isBlank()) return existingLabelIds to currentMode
+        val mergedLabels = existingLabelIds.toMutableList()
+        var nextMode = currentMode
+        rules.filter { it.enabled && it.keyword.isNotBlank() }.forEach { r ->
+            if (hay.contains(r.keyword.trim().lowercase(Locale.US))) {
+                r.labelIds.forEach { id -> if (!mergedLabels.contains(id)) mergedLabels.add(id) }
+                if (r.defaultPaymentMode != null) nextMode = r.defaultPaymentMode
+            }
+        }
+        return mergedLabels.toList() to nextMode
+    }
+
+    fun summarizeFriendIous(expenses: List<ExpenseRecord>, repayments: List<IouRepaymentRecord>): List<FriendIouSummary> {
+        val sharedMap = linkedMapOf<String, Pair<Double, Int>>()
+        val repaidMap = linkedMapOf<String, Double>()
+        val displayNames = linkedMapOf<String, String>()
+        expenses.forEach { exp ->
+            exp.splitShares.forEach { sp ->
+                val k = sp.friendName.trim().lowercase(Locale.US)
+                if (k.isNotBlank() && sp.amount > 0.0) {
+                    displayNames.putIfAbsent(k, sp.friendName.trim())
+                    val cur = sharedMap[k] ?: (0.0 to 0)
+                    sharedMap[k] = (cur.first + sp.amount) to (cur.second + 1)
+                }
+            }
+        }
+        repayments.forEach { rep ->
+            val k = rep.friendName.trim().lowercase(Locale.US)
+            if (k.isNotBlank() && rep.amount > 0.0) {
+                displayNames.putIfAbsent(k, rep.friendName.trim())
+                repaidMap[k] = (repaidMap[k] ?: 0.0) + rep.amount
+            }
+        }
+        return sharedMap.keys.union(repaidMap.keys).map { k ->
+            val shared = sharedMap[k]?.first ?: 0.0
+            val count = sharedMap[k]?.second ?: 0
+            val repaid = repaidMap[k] ?: 0.0
+            FriendIouSummary(
+                friendName = displayNames[k] ?: k,
+                totalShared = kotlin.math.round(shared * 100.0) / 100.0,
+                totalRepaid = kotlin.math.round(repaid * 100.0) / 100.0,
+                outstanding = kotlin.math.round((shared - repaid).coerceAtLeast(0.0) * 100.0) / 100.0,
+                itemCount = count
+            )
+        }.sortedByDescending { it.outstanding }
+    }
+
+    fun recordIouRepayment(
+        snapshot: LedgerSnapshot,
+        friendName: String,
+        amount: Double,
+        walletMode: PaymentMode,
+        note: String = ""
+    ): LedgerSnapshot {
+        val cleanAmt = kotlin.math.round(amount * 100.0) / 100.0
+        val cleanName = friendName.trim()
+        if (cleanAmt <= 0.0 || cleanName.isBlank()) return snapshot
+        val rep = IouRepaymentRecord(
+            friendName = cleanName,
+            amount = cleanAmt,
+            walletMode = walletMode,
+            at = nowIso(),
+            note = note.trim()
+        )
+        return snapshot.copy(iouRepayments = listOf(rep) + snapshot.iouRepayments)
+    }
+
+    fun computeSavingsGoalsProgress(goals: List<SavingsGoalItem>, txs: List<GoalTransaction>): List<GoalProgressSummary> {
+        return goals.map { g ->
+            val saved = txs.filter { it.goalId == g.id }.sumOf { if (it.kind == "withdraw") -it.amount else it.amount }.coerceAtLeast(0.0)
+            val pct = if (g.targetAmount > 0.0) kotlin.math.round((saved / g.targetAmount) * 100.0).toInt().coerceIn(0, 100) else 0
+            GoalProgressSummary(
+                goal = g,
+                savedAmount = kotlin.math.round(saved * 100.0) / 100.0,
+                pct = pct,
+                remaining = kotlin.math.round((g.targetAmount - saved).coerceAtLeast(0.0) * 100.0) / 100.0
+            )
+        }
+    }
+
+    fun recordGoalTransaction(
+        snapshot: LedgerSnapshot,
+        goalId: String,
+        kind: String,
+        amount: Double,
+        walletMode: PaymentMode,
+        note: String = ""
+    ): LedgerSnapshot {
+        val cleanAmt = kotlin.math.round(amount * 100.0) / 100.0
+        if (cleanAmt <= 0.0 || snapshot.savingsGoals.none { it.id == goalId }) return snapshot
+        val tx = GoalTransaction(
+            goalId = goalId,
+            kind = if (kind == "withdraw") "withdraw" else "deposit",
+            amount = cleanAmt,
+            walletMode = walletMode,
+            at = nowIso(),
+            note = note.trim()
+        )
+        return snapshot.copy(goalTransactions = listOf(tx) + snapshot.goalTransactions)
+    }
+
+    fun compute30DayForecast(snapshot: LedgerSnapshot): CashflowForecast30d {
+        val liveWallets = computeLiveWalletBalances(snapshot)
+        val liquidCash = liveWallets
+            .filter { it.mode == PaymentMode.UPI || it.mode == PaymentMode.CASH || it.mode == PaymentMode.BANK }
+            .sumOf { it.liveBalance }
+        val fmt = SimpleDateFormat("yyyy-MM-dd", Locale.US).apply { timeZone = TimeZone.getTimeZone("UTC") }
+        val todayStr = fmt.format(Date())
+        val todayMs = fmt.parse(todayStr)?.time ?: System.currentTimeMillis()
+        val items = mutableListOf<ForecastItem>()
+        snapshot.expenses.filter { it.entryType == EntryType.EXPENSE && it.status != ExpenseStatus.PAID && !it.dueDate.isNullOrBlank() }.forEach { exp ->
+            val rem = expenseRemainingPart(exp)
+            if (rem > 0.0) {
+                val dMs = try { fmt.parse(exp.dueDate!!)?.time } catch (_: Exception) { null }
+                if (dMs != null && dMs <= todayMs + 30L * MS_PER_DAY) {
+                    items.add(ForecastItem(exp.dueDate!!, exp.quote, rem, "due"))
+                }
+            }
+        }
+        snapshot.templates.filter { it.entryType == EntryType.EXPENSE && it.recurrence != RecurrenceCycle.NONE }.forEach { tpl ->
+            val mult = if (tpl.recurrence == RecurrenceCycle.WEEKLY) 4 else 1
+            items.add(ForecastItem(todayStr, "${tpl.title} (${tpl.recurrence.label} x$mult)", tpl.balance * mult, "recurring"))
+        }
+        val outflow = kotlin.math.round(items.sumOf { it.amount } * 100.0) / 100.0
+        val projected = kotlin.math.round((liquidCash - outflow) * 100.0) / 100.0
+        return CashflowForecast30d(
+            liquidCash = kotlin.math.round(liquidCash * 100.0) / 100.0,
+            projectedOutflow = outflow,
+            projectedBalance = projected,
+            shortfallAmount = if (projected < 0.0) kotlin.math.abs(projected) else 0.0,
+            items = items.sortedBy { it.dateKey }
+        )
+    }
+
+    fun isEncryptedEbakText(raw: String): Boolean {
+        return try {
+            val obj = JSONObject(raw)
+            obj.optString("format") == "expense-ledger-ebak-v1"
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    fun encryptEbakJson(snapshotJson: String, passphrase: String): String {
+        val cleanPass = passphrase.trim()
+        val salt = ByteArray(16).apply { SecureRandom().nextBytes(this) }
+        val iv = ByteArray(12).apply { SecureRandom().nextBytes(this) }
+        val factory = SecretKeyFactory.getInstance("PBKDF2WithHmacSHA256")
+        val spec = PBEKeySpec(cleanPass.toCharArray(), salt, 100_000, 256)
+        val keyBytes = factory.generateSecret(spec).encoded
+        val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+        cipher.init(Cipher.ENCRYPT_MODE, SecretKeySpec(keyBytes, "AES"), GCMParameterSpec(128, iv))
+        val encrypted = cipher.doFinal(snapshotJson.toByteArray(Charsets.UTF_8))
+        return JSONObject().apply {
+            put("format", "expense-ledger-ebak-v1")
+            put("iterations", 100_000)
+            put("salt", Base64.encodeToString(salt, Base64.NO_WRAP))
+            put("iv", Base64.encodeToString(iv, Base64.NO_WRAP))
+            put("cipher", Base64.encodeToString(encrypted, Base64.NO_WRAP))
+        }.toString(2)
+    }
+
+    fun decryptEbakJson(rawEbak: String, passphrase: String): String? {
+        return try {
+            val obj = JSONObject(rawEbak)
+            if (obj.optString("format") != "expense-ledger-ebak-v1") return null
+            val iterations = obj.optInt("iterations", 100_000).coerceAtLeast(1000)
+            val salt = Base64.decode(obj.getString("salt"), Base64.DEFAULT)
+            val iv = Base64.decode(obj.getString("iv"), Base64.DEFAULT)
+            val cipherBytes = Base64.decode(obj.getString("cipher"), Base64.DEFAULT)
+            val factory = SecretKeyFactory.getInstance("PBKDF2WithHmacSHA256")
+            val spec = PBEKeySpec(passphrase.trim().toCharArray(), salt, iterations, 256)
+            val keyBytes = factory.generateSecret(spec).encoded
+            val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+            cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(keyBytes, "AES"), GCMParameterSpec(128, iv))
+            String(cipher.doFinal(cipherBytes), Charsets.UTF_8)
+        } catch (_: Exception) {
+            null
         }
     }
 
@@ -936,7 +1440,11 @@ object LedgerMath {
         return rows
     }
 
-    fun parseCsvImport(csvText: String, existingLabels: List<LabelRecord>): CsvImportResult {
+    fun parseCsvImport(
+        csvText: String,
+        existingLabels: List<LabelRecord>,
+        autoRules: List<AutoLabelRule> = emptyList()
+    ): CsvImportResult {
         val rows = parseCsvRows(csvText)
         if (rows.size < 2) {
             return CsvImportResult(emptyList(), emptyList(), 0, listOf("CSV needs header and at least 1 row."))
@@ -975,7 +1483,8 @@ object LedgerMath {
             val quote = cols.getOrNull(colQuote)?.trim().orEmpty().ifBlank { "Imported Row $r" }
             val entryType = EntryType.fromString(cols.getOrNull(colType).orEmpty())
             val status = if (entryType == EntryType.INCOME) ExpenseStatus.PAID else ExpenseStatus.fromString(cols.getOrNull(colStatus).orEmpty())
-            val mode = PaymentMode.fromString(cols.getOrNull(colMode).orEmpty())
+            val rawModeStr = cols.getOrNull(colMode).orEmpty()
+            val mode = PaymentMode.fromString(rawModeStr)
             val pinRaw = cols.getOrNull(colPin).orEmpty().trim().lowercase(Locale.US)
             val isPinned = pinRaw == "yes" || pinRaw == "true" || pinRaw == "1"
             val dueRaw = cols.getOrNull(colDue)?.trim().orEmpty()
@@ -1004,18 +1513,20 @@ object LedgerMath {
                     if (!rowLblIds.contains(lbl.id)) rowLblIds.add(lbl.id)
                 }
             }
+            val (ruleLabels, ruleMode) = applyAutoLabelRules(quote, autoRules, rowLblIds, mode)
+            val finalMode = if (rawModeStr.isBlank()) ruleMode else mode
 
             validEntries.add(
                 ExpenseRecord(
                     balance = amt,
                     quote = quote,
                     status = status,
-                    labelIds = rowLblIds,
+                    labelIds = ruleLabels,
                     createdAt = now,
                     updatedAt = now,
-                    auditLog = listOf(AuditEntry(action = "Created", at = now, summary = "Imported CSV ₹${formatAmt(amt)} (${mode.label})")),
+                    auditLog = listOf(AuditEntry(action = "Created", at = now, summary = "Imported CSV ₹${formatAmt(amt)} (${finalMode.label})")),
                     entryType = entryType,
-                    paymentMode = mode,
+                    paymentMode = finalMode,
                     isPinned = isPinned,
                     dueDate = dueDate
                 )
@@ -1169,6 +1680,17 @@ class LedgerDbHelper(context: Context) : SQLiteOpenHelper(context, "expense_ledg
         put("createdAt", e.createdAt)
         put("updatedAt", e.updatedAt)
         put("auditLog", encodeAuditList(e.auditLog))
+        if (e.splitShares.isNotEmpty()) {
+            put("splitShares", JSONArray().apply {
+                e.splitShares.forEach { sp ->
+                    put(JSONObject().apply {
+                        put("id", sp.id)
+                        put("friendName", sp.friendName)
+                        put("amount", sp.amount)
+                    })
+                }
+            })
+        }
     }
 
     fun encodeTemplate(t: ExpenseTemplateRecord): JSONObject = JSONObject().apply {
@@ -1246,6 +1768,61 @@ class LedgerDbHelper(context: Context) : SQLiteOpenHelper(context, "expense_ledg
         root.put("dueRemindersEnabled", snapshot.dueRemindersEnabled)
         root.put("walletStartingBalances", startObj)
         root.put("walletTransfers", trfArr)
+        root.put("calendarPrefs", JSONObject().apply {
+            put("weekStart", snapshot.calendarPrefs.weekStart.key)
+            put("showIsoWeeks", snapshot.calendarPrefs.showIsoWeeks)
+            put("region", snapshot.calendarPrefs.region.key)
+        })
+        root.put("autoLabelRules", JSONArray().apply {
+            snapshot.autoLabelRules.forEach { r ->
+                put(JSONObject().apply {
+                    put("id", r.id)
+                    put("keyword", r.keyword)
+                    put("labelIds", JSONArray(r.labelIds))
+                    put("defaultPaymentMode", r.defaultPaymentMode?.label ?: JSONObject.NULL)
+                    put("enabled", r.enabled)
+                })
+            }
+        })
+        root.put("iouRepayments", JSONArray().apply {
+            snapshot.iouRepayments.forEach { rep ->
+                put(JSONObject().apply {
+                    put("id", rep.id)
+                    put("friendName", rep.friendName)
+                    put("amount", rep.amount)
+                    put("walletMode", rep.walletMode.label)
+                    put("at", rep.at)
+                    if (rep.note.isNotBlank()) put("note", rep.note)
+                })
+            }
+        })
+        root.put("savingsGoals", JSONArray().apply {
+            snapshot.savingsGoals.forEach { g ->
+                put(JSONObject().apply {
+                    put("id", g.id)
+                    put("title", g.title)
+                    put("targetAmount", g.targetAmount)
+                    put("targetDate", g.targetDate ?: JSONObject.NULL)
+                    put("monthlyTarget", g.monthlyTarget ?: JSONObject.NULL)
+                    put("colorHex", g.colorHex)
+                    put("createdAt", g.createdAt)
+                })
+            }
+        })
+        root.put("goalTransactions", JSONArray().apply {
+            snapshot.goalTransactions.forEach { tx ->
+                put(JSONObject().apply {
+                    put("id", tx.id)
+                    put("goalId", tx.goalId)
+                    put("kind", tx.kind)
+                    put("amount", tx.amount)
+                    put("walletMode", tx.walletMode.label)
+                    put("at", tx.at)
+                    if (tx.note.isNotBlank()) put("note", tx.note)
+                })
+            }
+        })
+        root.put("autoLockSeconds", snapshot.autoLockSeconds)
         return root.toString()
     }
 
@@ -1337,6 +1914,19 @@ class LedgerDbHelper(context: Context) : SQLiteOpenHelper(context, "expense_ledg
             )
         } else null
 
+        val splits = mutableListOf<ExpenseSplitShare>()
+        val spArr = o.optJSONArray("splitShares")
+        if (spArr != null) {
+            for (j in 0 until spArr.length()) {
+                val so = spArr.optJSONObject(j) ?: continue
+                val name = so.optString("friendName").trim()
+                val sAmt = so.optDouble("amount", 0.0)
+                if (name.isNotBlank() && sAmt > 0.0) {
+                    splits.add(ExpenseSplitShare(id = so.optString("id").ifBlank { "sp-$j" }, friendName = name, amount = sAmt))
+                }
+            }
+        }
+
         return ExpenseRecord(
             id = o.optString("id"),
             balance = balance,
@@ -1355,7 +1945,8 @@ class LedgerDbHelper(context: Context) : SQLiteOpenHelper(context, "expense_ledg
             dueDate = dueDate,
             paidAmount = paidAmount,
             partialPayments = partials,
-            receiptAttachment = receipt
+            receiptAttachment = receipt,
+            splitShares = splits
         )
     }
 
@@ -1486,6 +2077,67 @@ class LedgerDbHelper(context: Context) : SQLiteOpenHelper(context, "expense_ledg
                 }
             }
 
+            val cpObj = root.optJSONObject("calendarPrefs")
+            val calendarPrefs = CalendarPreferences(
+                weekStart = CalendarWeekStart.fromKey(cpObj?.optString("weekStart", "mon") ?: "mon"),
+                showIsoWeeks = cpObj?.optBoolean("showIsoWeeks", true) ?: true,
+                region = CalendarRegionCode.fromKey(cpObj?.optString("region", "in") ?: "in")
+            )
+
+            val autoRules = mutableListOf<AutoLabelRule>()
+            val arArr = root.optJSONArray("autoLabelRules") ?: JSONArray()
+            for (i in 0 until arArr.length()) {
+                val o = arArr.optJSONObject(i) ?: continue
+                val kw = o.optString("keyword").trim()
+                if (kw.isBlank()) continue
+                val lIds = mutableListOf<String>()
+                val lArr = o.optJSONArray("labelIds") ?: JSONArray()
+                for (j in 0 until lArr.length()) {
+                    val s = lArr.optString(j)
+                    if (s.isNotBlank()) lIds.add(s)
+                }
+                val defMode = if (o.isNull("defaultPaymentMode")) null else PaymentMode.fromString(o.optString("defaultPaymentMode"))
+                autoRules.add(AutoLabelRule(id = o.optString("id").ifBlank { "rule-$i" }, keyword = kw, labelIds = lIds, defaultPaymentMode = defMode, enabled = o.optBoolean("enabled", true)))
+            }
+
+            val iouReps = mutableListOf<IouRepaymentRecord>()
+            val irArr = root.optJSONArray("iouRepayments") ?: JSONArray()
+            for (i in 0 until irArr.length()) {
+                val o = irArr.optJSONObject(i) ?: continue
+                val amt = o.optDouble("amount", 0.0)
+                val fn = o.optString("friendName").trim()
+                if (fn.isNotBlank() && amt > 0.0) {
+                    iouReps.add(IouRepaymentRecord(id = o.optString("id").ifBlank { "rep-$i" }, friendName = fn, amount = amt, walletMode = PaymentMode.fromString(o.optString("walletMode", "UPI")), at = o.optString("at", LedgerMath.nowIso()), note = o.optString("note", "")))
+                }
+            }
+
+            val goals = mutableListOf<SavingsGoalItem>()
+            val gArr = root.optJSONArray("savingsGoals") ?: JSONArray()
+            for (i in 0 until gArr.length()) {
+                val o = gArr.optJSONObject(i) ?: continue
+                val t = o.optString("title").trim()
+                val tgt = o.optDouble("targetAmount", 0.0)
+                if (t.isNotBlank() && tgt > 0.0) {
+                    val tDate = if (o.isNull("targetDate")) null else o.optString("targetDate").takeIf { it.isNotBlank() }
+                    val mTgt = if (o.isNull("monthlyTarget")) null else o.optDouble("monthlyTarget", 0.0).takeIf { it > 0.0 }
+                    goals.add(SavingsGoalItem(id = o.optString("id").ifBlank { "goal-$i" }, title = t, targetAmount = tgt, targetDate = tDate, monthlyTarget = mTgt, colorHex = o.optString("colorHex", "#059669"), createdAt = o.optString("createdAt", LedgerMath.nowIso())))
+                }
+            }
+
+            val gTxs = mutableListOf<GoalTransaction>()
+            val gtArr = root.optJSONArray("goalTransactions") ?: JSONArray()
+            for (i in 0 until gtArr.length()) {
+                val o = gtArr.optJSONObject(i) ?: continue
+                val amt = o.optDouble("amount", 0.0)
+                val gId = o.optString("goalId")
+                if (gId.isNotBlank() && amt > 0.0) {
+                    gTxs.add(GoalTransaction(id = o.optString("id").ifBlank { "gtx-$i" }, goalId = gId, kind = o.optString("kind", "deposit"), amount = amt, walletMode = PaymentMode.fromString(o.optString("walletMode", "Bank")), at = o.optString("at", LedgerMath.nowIso()), note = o.optString("note", "")))
+                }
+            }
+
+            val rawAutoLock = root.optInt("autoLockSeconds", 0)
+            val autoLockSeconds = if (rawAutoLock == 30 || rawAutoLock == 60 || rawAutoLock == 300) rawAutoLock else 0
+
             LedgerSnapshot(
                 expenses = expenses,
                 labels = labels,
@@ -1500,7 +2152,13 @@ class LedgerDbHelper(context: Context) : SQLiteOpenHelper(context, "expense_ledg
                 themeMode = themeMode,
                 dueRemindersEnabled = dueRemindersEnabled,
                 walletStartingBalances = startingBalances,
-                walletTransfers = transfers
+                walletTransfers = transfers,
+                calendarPrefs = calendarPrefs,
+                autoLabelRules = autoRules,
+                iouRepayments = iouReps,
+                savingsGoals = goals,
+                goalTransactions = gTxs,
+                autoLockSeconds = autoLockSeconds
             )
         } catch (_: Exception) {
             createSeedSnapshot()
@@ -1701,6 +2359,17 @@ class LedgerDbHelper(context: Context) : SQLiteOpenHelper(context, "expense_ledg
         )
         val startBalances = mapOf(PaymentMode.UPI to 4000.0, PaymentMode.CASH to 1500.0, PaymentMode.CARD to 0.0, PaymentMode.BANK to 12000.0)
         val seedTransfers = listOf(WalletTransferRecord("trf-seed-1", PaymentMode.BANK, PaymentMode.UPI, 2000.0, "Weekly UPI wallet top-up", t2))
+        val seedRules = listOf(
+            AutoLabelRule("rule-clinic", "clinic", listOf("lbl-dr"), PaymentMode.UPI, true),
+            AutoLabelRule("rule-school", "school", listOf("lbl-school"), PaymentMode.CASH, true),
+            AutoLabelRule("rule-veg", "produce", listOf("lbl-vegetables"), PaymentMode.CASH, true)
+        )
+        val seedGoals = listOf(
+            SavingsGoalItem("goal-emergency", "Emergency Clinic Reserve", 5000.0, "2026-12-31", 1000.0, "#059669", t1)
+        )
+        val seedGoalTxs = listOf(
+            GoalTransaction("gtx-1", "goal-emergency", "deposit", 1500.0, PaymentMode.BANK, t2, "Initial sinking fund")
+        )
         return LedgerSnapshot(
             expenses = expenses,
             labels = labels,
@@ -1715,7 +2384,13 @@ class LedgerDbHelper(context: Context) : SQLiteOpenHelper(context, "expense_ledg
             themeMode = ThemeMode.SYSTEM,
             dueRemindersEnabled = true,
             walletStartingBalances = startBalances,
-            walletTransfers = seedTransfers
+            walletTransfers = seedTransfers,
+            calendarPrefs = CalendarPreferences(CalendarWeekStart.MON, true, CalendarRegionCode.IN),
+            autoLabelRules = seedRules,
+            iouRepayments = emptyList(),
+            savingsGoals = seedGoals,
+            goalTransactions = seedGoalTxs,
+            autoLockSeconds = 0
         )
     }
 }

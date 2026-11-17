@@ -40,6 +40,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
@@ -50,6 +51,11 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import androidx.fragment.app.FragmentActivity
+import androidx.glance.appwidget.updateAll
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlin.math.round
 
@@ -183,6 +189,13 @@ fun ExpenseLedgerApp(
 
     // v1.2, v1.3 & v1.4 Controls: Insights, Bin, Bulk Select, Templates, Privacy/Biometrics, CSV, Partial Pay & Receipts
     var showInsightsDialog by remember { mutableStateOf(false) }
+    var showCalendarDialog by remember { mutableStateOf(false) }
+    var showAutoRulesDialog by remember { mutableStateOf(false) }
+    var ebakDialogMode by remember { mutableStateOf<String?>(null) } // "export" | "restore"
+    var pendingEbakText by remember { mutableStateOf<String?>(null) }
+    var pendingEbakPassphrase by remember { mutableStateOf("") }
+    var exactDateFilter by remember { mutableStateOf<String?>(null) }
+    var prefillSplitShares by remember { mutableStateOf<List<ExpenseSplitShare>>(emptyList()) }
     var showBinDialog by remember { mutableStateOf(false) }
     var showPrivacyDialog by remember { mutableStateOf(false) }
     var showCsvImportDialog by remember { mutableStateOf(false) }
@@ -192,9 +205,35 @@ fun ExpenseLedgerApp(
     var pendingPdfMonthKey by remember { mutableStateOf<String?>(null) }
     var pendingCsvText by remember { mutableStateOf("") }
     var isLocked by remember { mutableStateOf(!snapshot.privacyPinHash.isNullOrBlank()) }
+    var lastPausedAtMs by remember { mutableStateOf<Long?>(null) }
     var bulkMode by remember { mutableStateOf(false) }
     var selectedExpenseIds by remember { mutableStateOf<Set<String>>(emptySet()) }
     var showQuickTemplates by remember { mutableStateOf(true) }
+
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner, snapshot.privacyPinHash, snapshot.autoLockSeconds) {
+        val observer = LifecycleEventObserver { _, event ->
+            when (event) {
+                Lifecycle.Event.ON_STOP -> {
+                    lastPausedAtMs = System.currentTimeMillis()
+                }
+                Lifecycle.Event.ON_START -> {
+                    val pausedAt = lastPausedAtMs
+                    val secs = snapshot.autoLockSeconds
+                    if (pausedAt != null && secs > 0 && !snapshot.privacyPinHash.isNullOrBlank()) {
+                        val elapsedMs = System.currentTimeMillis() - pausedAt
+                        if (elapsedMs >= secs * 1000L) {
+                            isLocked = true
+                        }
+                    }
+                    lastPausedAtMs = null
+                }
+                else -> {}
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
 
     LaunchedEffect(initialShortcutAction, isLocked) {
         if (!initialShortcutAction.isNullOrBlank() && !isLocked) {
@@ -214,8 +253,10 @@ fun ExpenseLedgerApp(
                     prefillCalcHistoryId = null
                     prefillCalcFormula = null
                     pendingReceiptAttachment = null
+                    prefillSplitShares = emptyList()
                     showExpenseModal = true
                 }
+                "calendar" -> showCalendarDialog = true
                 "quick_calc" -> showCalculatorSheet = true
                 "insights" -> showInsightsDialog = true
             }
@@ -229,6 +270,12 @@ fun ExpenseLedgerApp(
     fun persist(updated: LedgerSnapshot) {
         snapshot = updated
         dbHelper.saveSnapshot(updated)
+        CoroutineScope(Dispatchers.IO).launch {
+            try {
+                BalanceWidget().updateAll(context)
+            } catch (_: Exception) {
+            }
+        }
     }
 
     fun showActionSnackbar(message: String, undoSnapshot: LedgerSnapshot? = null) {
@@ -330,21 +377,44 @@ fun ExpenseLedgerApp(
         }
     }
 
+    val exportEbakLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.CreateDocument("application/octet-stream")
+    ) { uri ->
+        if (uri != null && pendingEbakPassphrase.isNotBlank()) {
+            try {
+                val payload = LedgerMath.encryptEbakJson(dbHelper.encodeSnapshot(snapshot), pendingEbakPassphrase)
+                context.contentResolver.openOutputStream(uri)?.use { stream ->
+                    stream.write(payload.toByteArray(Charsets.UTF_8))
+                }
+                pendingEbakPassphrase = ""
+                showActionSnackbar("Exported AES-256 encrypted .ebak backup")
+            } catch (_: Exception) {
+                pendingEbakPassphrase = ""
+                showActionSnackbar("Could not export encrypted .ebak backup")
+            }
+        }
+    }
+
     val importBackupLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenDocument()
     ) { uri ->
         if (uri != null) {
             try {
                 val raw = context.contentResolver.openInputStream(uri)?.bufferedReader()?.use { it.readText() } ?: ""
-                val restored = dbHelper.validateBackupJson(raw)
-                if (restored != null) {
-                    val prev = snapshot
-                    persist(restored)
-                    selectedExpenseIds = emptySet()
-                    bulkMode = false
-                    showActionSnackbar("Restored ${restored.expenses.size} expenses from JSON", prev)
+                if (LedgerMath.isEncryptedEbakText(raw)) {
+                    pendingEbakText = raw
+                    ebakDialogMode = "restore"
                 } else {
-                    showActionSnackbar("Invalid ledger backup JSON file")
+                    val restored = dbHelper.validateBackupJson(raw)
+                    if (restored != null) {
+                        val prev = snapshot
+                        persist(restored)
+                        selectedExpenseIds = emptySet()
+                        bulkMode = false
+                        showActionSnackbar("Restored ${restored.expenses.size} expenses from JSON", prev)
+                    } else {
+                        showActionSnackbar("Invalid ledger backup JSON file")
+                    }
                 }
             } catch (_: Exception) {
                 showActionSnackbar("Failed to read backup file")
@@ -412,6 +482,9 @@ fun ExpenseLedgerApp(
                                     contentDescription = if (snapshot.hideBalances) "Show balances" else "Hide balances"
                                 )
                             }
+                            IconButton(onClick = { showCalendarDialog = true }) {
+                                Icon(Icons.Default.CalendarMonth, contentDescription = "1-Click International Calendar")
+                            }
                             IconButton(onClick = { showPrivacyDialog = true }) {
                                 Icon(Icons.Default.Lock, contentDescription = "Privacy PIN Lock")
                             }
@@ -455,7 +528,15 @@ fun ExpenseLedgerApp(
                                     onDismissRequest = { showOverflowMenu = false }
                                 ) {
                                     DropdownMenuItem(
-                                        text = { Text("Insights, Cashflow & Calendar") },
+                                        text = { Text("International Calendar") },
+                                        leadingIcon = { Icon(Icons.Default.CalendarMonth, contentDescription = null) },
+                                        onClick = {
+                                            showOverflowMenu = false
+                                            showCalendarDialog = true
+                                        }
+                                    )
+                                    DropdownMenuItem(
+                                        text = { Text("Insights, Cashflow & Goals") },
                                         leadingIcon = { Icon(Icons.Default.BarChart, contentDescription = null) },
                                         onClick = {
                                             showOverflowMenu = false
@@ -463,7 +544,15 @@ fun ExpenseLedgerApp(
                                         }
                                     )
                                     DropdownMenuItem(
-                                        text = { Text("Privacy PIN Lock") },
+                                        text = { Text("Auto-Label Rules (${snapshot.autoLabelRules.size})") },
+                                        leadingIcon = { Icon(Icons.Default.AutoAwesome, contentDescription = null) },
+                                        onClick = {
+                                            showOverflowMenu = false
+                                            showAutoRulesDialog = true
+                                        }
+                                    )
+                                    DropdownMenuItem(
+                                        text = { Text("Privacy, PIN & .ebak Vault") },
                                         leadingIcon = { Icon(Icons.Default.Lock, contentDescription = null) },
                                         onClick = {
                                             showOverflowMenu = false
@@ -513,7 +602,16 @@ fun ExpenseLedgerApp(
                                         }
                                     )
                                     DropdownMenuItem(
-                                        text = { Text("Restore Backup (.json)") },
+                                        text = { Text("Export Encrypted (.ebak)") },
+                                        leadingIcon = { Icon(Icons.Default.EnhancedEncryption, contentDescription = null) },
+                                        onClick = {
+                                            showOverflowMenu = false
+                                            pendingEbakText = null
+                                            ebakDialogMode = "export"
+                                        }
+                                    )
+                                    DropdownMenuItem(
+                                        text = { Text("Restore Backup (.json / .ebak)") },
                                         leadingIcon = { Icon(Icons.Default.Upload, contentDescription = null) },
                                         onClick = {
                                             showOverflowMenu = false
@@ -586,6 +684,7 @@ fun ExpenseLedgerApp(
                                     prefillCalcHistoryId = null
                                     prefillCalcFormula = null
                                     pendingReceiptAttachment = null
+                                    prefillSplitShares = emptyList()
                                     showExpenseModal = true
                                 }
                                 LedgerTab.LABELS -> {
@@ -623,6 +722,7 @@ fun ExpenseLedgerApp(
                         entryTypeFilter = entryTypeFilter,
                         paymentModeFilter = paymentModeFilter,
                         dateWindowFilter = dateWindowFilter,
+                        exactDateFilter = exactDateFilter,
                         pinnedOnlyFilter = pinnedOnlyFilter,
                         labelFilterId = labelFilterId,
                         bulkMode = bulkMode,
@@ -633,6 +733,7 @@ fun ExpenseLedgerApp(
                         onEntryTypeFilterChange = { entryTypeFilter = it },
                         onPaymentModeFilterChange = { paymentModeFilter = it },
                         onDateWindowFilterChange = { dateWindowFilter = it },
+                        onClearExactDate = { exactDateFilter = null },
                         onPinnedOnlyFilterChange = { pinnedOnlyFilter = it },
                         onLabelFilterChange = { labelFilterId = it },
                         onClearFilters = {
@@ -641,6 +742,7 @@ fun ExpenseLedgerApp(
                             entryTypeFilter = null
                             paymentModeFilter = null
                             dateWindowFilter = DateWindowFilter.ALL
+                            exactDateFilter = null
                             pinnedOnlyFilter = false
                             labelFilterId = null
                         },
@@ -815,6 +917,7 @@ fun ExpenseLedgerApp(
                             prefillCalcHistoryId = exp.calcHistoryId
                             prefillCalcFormula = exp.calcFormula
                             pendingReceiptAttachment = exp.receiptAttachment
+                            prefillSplitShares = exp.splitShares
                             showExpenseModal = true
                         },
                         onDelete = { expId ->
@@ -855,6 +958,7 @@ fun ExpenseLedgerApp(
                             prefillCalcHistoryId = null
                             prefillCalcFormula = null
                             pendingReceiptAttachment = null
+                            prefillSplitShares = emptyList()
                             activeTab = LedgerTab.EXPENSES
                             showExpenseModal = true
                         },
@@ -892,6 +996,7 @@ fun ExpenseLedgerApp(
                             prefillCalcHistoryId = null
                             prefillCalcFormula = null
                             pendingReceiptAttachment = null
+                            prefillSplitShares = emptyList()
                             activeTab = LedgerTab.EXPENSES
                             showExpenseModal = true
                         }
@@ -912,9 +1017,11 @@ fun ExpenseLedgerApp(
                 initialDueDate = prefillDueDate,
                 initialLabelIds = prefillLabelIds,
                 initialAttachedListIds = prefillAttachedListIds,
+                initialSplitShares = prefillSplitShares,
                 calcFormula = prefillCalcFormula,
                 receiptAttachment = pendingReceiptAttachment,
                 expensesHistory = snapshot.expenses,
+                autoRules = snapshot.autoLabelRules,
                 labels = snapshot.labels,
                 lists = snapshot.lists,
                 onPickReceiptPhoto = {
@@ -922,7 +1029,7 @@ fun ExpenseLedgerApp(
                 },
                 onClearReceiptPhoto = { pendingReceiptAttachment = null },
                 onDismiss = { showExpenseModal = false },
-                onSave = { balance, quote, status, labelIds, attachedListIds, saveAsTemplate, recurrence, entryType, paymentMode, isPinned, dueDate ->
+                onSave = { balance, quote, status, labelIds, attachedListIds, saveAsTemplate, recurrence, entryType, paymentMode, isPinned, dueDate, splitShares ->
                     val now = LedgerMath.nowIso()
                     val finalStatus = if (entryType == EntryType.INCOME) ExpenseStatus.PAID else status
                     val normalizedDue = dueDate.trim().takeIf { Regex("""^\d{4}-\d{2}-\d{2}$""").matches(it) }
@@ -943,7 +1050,8 @@ fun ExpenseLedgerApp(
                             isPinned = isPinned,
                             dueDate = normalizedDue,
                             paidAmount = if (finalStatus == ExpenseStatus.PAID) balance else 0.0,
-                            receiptAttachment = pendingReceiptAttachment
+                            receiptAttachment = pendingReceiptAttachment,
+                            splitShares = splitShares
                         )
                         listOf(entry) + snapshot.expenses
                     } else {
@@ -965,7 +1073,8 @@ fun ExpenseLedgerApp(
                                     isPinned = isPinned,
                                     dueDate = normalizedDue,
                                     paidAmount = nextPaid,
-                                    receiptAttachment = pendingReceiptAttachment
+                                    receiptAttachment = pendingReceiptAttachment,
+                                    splitShares = splitShares
                                 )
                             } else item
                         }
@@ -1097,6 +1206,8 @@ fun ExpenseLedgerApp(
                         prefillAttachedListIds = emptyList()
                         prefillCalcHistoryId = historyId ?: snapshot.calculatorHistory.firstOrNull()?.id
                         prefillCalcFormula = formula.ifBlank { null }
+                        pendingReceiptAttachment = null
+                        prefillSplitShares = emptyList()
                         showExpenseModal = true
                     },
                     onInsertIntoList = { result, formula ->
@@ -1167,7 +1278,142 @@ fun ExpenseLedgerApp(
                 onDeleteTransfer = { trfId ->
                     persist(snapshot.copy(walletTransfers = snapshot.walletTransfers.filterNot { it.id == trfId }))
                 },
+                onRecordIouRepayment = { friendName, amt, walletMode, note ->
+                    persist(LedgerMath.recordIouRepayment(snapshot, friendName, amt, walletMode, note))
+                    showActionSnackbar("Recorded ₹${formatAmount(amt)} IOU repayment from $friendName")
+                },
+                onCreateGoal = { title, targetAmt, targetDate ->
+                    val cleanTitle = title.trim()
+                    if (cleanTitle.isNotBlank() && targetAmt > 0.0) {
+                        val goal = SavingsGoalItem(
+                            title = cleanTitle,
+                            targetAmount = targetAmt,
+                            targetDate = targetDate.trim().takeIf { Regex("""^\d{4}-\d{2}-\d{2}$""").matches(it) },
+                            createdAt = LedgerMath.nowIso()
+                        )
+                        persist(snapshot.copy(savingsGoals = listOf(goal) + snapshot.savingsGoals))
+                        showActionSnackbar("Created goal '$cleanTitle'")
+                    }
+                },
+                onGoalTransaction = { goalId, kind, amt, walletMode ->
+                    persist(LedgerMath.recordGoalTransaction(snapshot, goalId, kind, amt, walletMode))
+                    showActionSnackbar(if (kind == "withdraw") "Withdrew ₹${formatAmount(amt)} from goal" else "Deposited ₹${formatAmount(amt)} into goal")
+                },
+                onOpenInternationalCalendar = {
+                    showInsightsDialog = false
+                    showCalendarDialog = true
+                },
                 onDismiss = { showInsightsDialog = false }
+            )
+        }
+
+        if (showCalendarDialog) {
+            InternationalCalendarDialog(
+                appName = "Expense Ledger",
+                snapshot = snapshot,
+                onUpdatePrefs = { nextPrefs -> persist(snapshot.copy(calendarPrefs = nextPrefs)) },
+                onLogOnDate = { dateKey ->
+                    showCalendarDialog = false
+                    activeTab = LedgerTab.EXPENSES
+                    editingExpense = null
+                    prefillBalance = ""
+                    prefillQuote = ""
+                    prefillStatus = ExpenseStatus.NEED
+                    prefillEntryType = EntryType.EXPENSE
+                    prefillPaymentMode = PaymentMode.UPI
+                    prefillIsPinned = false
+                    prefillDueDate = dateKey
+                    prefillLabelIds = emptyList()
+                    prefillAttachedListIds = emptyList()
+                    prefillCalcHistoryId = null
+                    prefillCalcFormula = null
+                    pendingReceiptAttachment = null
+                    prefillSplitShares = emptyList()
+                    showExpenseModal = true
+                },
+                onFilterFeedByDate = { dateKey ->
+                    exactDateFilter = dateKey
+                    activeTab = LedgerTab.EXPENSES
+                    showCalendarDialog = false
+                },
+                onPartialPay = { exp ->
+                    showCalendarDialog = false
+                    partialPayTarget = exp
+                },
+                onLogTemplateNow = { tpl ->
+                    val now = LedgerMath.nowIso()
+                    val created = ExpenseRecord(
+                        balance = tpl.balance,
+                        quote = tpl.title,
+                        status = if (tpl.entryType == EntryType.INCOME) ExpenseStatus.PAID else tpl.defaultStatus,
+                        labelIds = tpl.labelIds,
+                        attachedListIds = tpl.attachedListIds,
+                        createdAt = now,
+                        updatedAt = now,
+                        auditLog = listOf(AuditEntry(action = "Created", at = now, summary = "Calendar recurring log: ₹${formatAmount(tpl.balance)}")),
+                        entryType = tpl.entryType,
+                        paymentMode = tpl.paymentMode,
+                        paidAmount = if (tpl.entryType == EntryType.INCOME || tpl.defaultStatus == ExpenseStatus.PAID) tpl.balance else 0.0
+                    )
+                    val updatedTpls = snapshot.templates.map { if (it.id == tpl.id) it.copy(lastUsedAt = now) else it }
+                    persist(snapshot.copy(expenses = listOf(created) + snapshot.expenses, templates = updatedTpls))
+                    showActionSnackbar("Logged '${tpl.title}' from Calendar")
+                },
+                onShareIcs = { icsText ->
+                    val sendIntent = Intent(Intent.ACTION_SEND).apply {
+                        type = "text/calendar"
+                        putExtra(Intent.EXTRA_SUBJECT, "Expense Ledger Calendar (.ics)")
+                        putExtra(Intent.EXTRA_TEXT, icsText)
+                    }
+                    context.startActivity(Intent.createChooser(sendIntent, "Export Calendar (.ics)"))
+                },
+                onDismiss = { showCalendarDialog = false }
+            )
+        }
+
+        if (showAutoRulesDialog) {
+            AutoRulesDialog(
+                rules = snapshot.autoLabelRules,
+                labels = snapshot.labels,
+                onSaveRules = { nextRules ->
+                    persist(snapshot.copy(autoLabelRules = nextRules))
+                    showActionSnackbar("Saved ${nextRules.size} auto-label rules")
+                },
+                onDismiss = { showAutoRulesDialog = false }
+            )
+        }
+
+        if (ebakDialogMode != null) {
+            EncryptedBackupDialog(
+                mode = ebakDialogMode!!,
+                onDismiss = {
+                    ebakDialogMode = null
+                    pendingEbakText = null
+                },
+                onExportPassphrase = { pass ->
+                    pendingEbakPassphrase = pass
+                    ebakDialogMode = null
+                    exportEbakLauncher.launch("expense-ledger-backup.ebak")
+                },
+                onDecryptPassphrase = { pass ->
+                    val raw = pendingEbakText.orEmpty()
+                    val decryptedJson = LedgerMath.decryptEbakJson(raw, pass)
+                    if (decryptedJson == null) {
+                        false
+                    } else {
+                        val restored = dbHelper.validateBackupJson(decryptedJson)
+                        if (restored != null) {
+                            val prev = snapshot
+                            persist(restored)
+                            ebakDialogMode = null
+                            pendingEbakText = null
+                            showActionSnackbar("Decrypted & restored ${restored.expenses.size} expenses", prev)
+                            true
+                        } else {
+                            false
+                        }
+                    }
+                }
             )
         }
 
@@ -1209,6 +1455,9 @@ fun ExpenseLedgerApp(
                 onChangeThemeMode = { nextMode ->
                     persist(snapshot.copy(themeMode = nextMode))
                 },
+                onChangeAutoLock = { secs ->
+                    persist(snapshot.copy(autoLockSeconds = secs))
+                },
                 onToggleDueReminders = { enabled ->
                     if (enabled && Build.VERSION.SDK_INT >= 33 &&
                         ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
@@ -1218,6 +1467,19 @@ fun ExpenseLedgerApp(
                         persist(snapshot.copy(dueRemindersEnabled = enabled))
                         BillDueScheduler.sync(context, enabled)
                     }
+                },
+                onOpenAutoRules = {
+                    showPrivacyDialog = false
+                    showAutoRulesDialog = true
+                },
+                onExportEbak = {
+                    showPrivacyDialog = false
+                    pendingEbakText = null
+                    ebakDialogMode = "export"
+                },
+                onImportEbak = {
+                    showPrivacyDialog = false
+                    importBackupLauncher.launch(arrayOf("*/*"))
                 },
                 onSetPin = { newPin ->
                     persist(snapshot.copy(privacyPinHash = LedgerMath.sha256Pin(newPin)))
@@ -1241,6 +1503,7 @@ fun ExpenseLedgerApp(
             CsvImportDialog(
                 initialCsvText = pendingCsvText,
                 existingLabels = snapshot.labels,
+                autoRules = snapshot.autoLabelRules,
                 onPickFile = { importCsvLauncher.launch(arrayOf("text/csv", "text/comma-separated-values", "*/*")) },
                 onDismiss = { showCsvImportDialog = false },
                 onConfirmImport = { validEntries, newLabels ->
@@ -1324,6 +1587,7 @@ private fun ExpensesScreen(
     entryTypeFilter: EntryType?,
     paymentModeFilter: PaymentMode?,
     dateWindowFilter: DateWindowFilter,
+    exactDateFilter: String?,
     pinnedOnlyFilter: Boolean,
     labelFilterId: String?,
     bulkMode: Boolean,
@@ -1334,6 +1598,7 @@ private fun ExpensesScreen(
     onEntryTypeFilterChange: (EntryType?) -> Unit,
     onPaymentModeFilterChange: (PaymentMode?) -> Unit,
     onDateWindowFilterChange: (DateWindowFilter) -> Unit,
+    onClearExactDate: () -> Unit,
     onPinnedOnlyFilterChange: (Boolean) -> Unit,
     onLabelFilterChange: (String?) -> Unit,
     onClearFilters: () -> Unit,
@@ -1354,12 +1619,13 @@ private fun ExpensesScreen(
     onDelete: (String) -> Unit
 ) {
     val q = searchQuery.trim()
-    val filteredExpenses = remember(expenses, labels, lists, q, statusFilter, entryTypeFilter, paymentModeFilter, dateWindowFilter, pinnedOnlyFilter, labelFilterId) {
+    val filteredExpenses = remember(expenses, labels, lists, q, statusFilter, entryTypeFilter, paymentModeFilter, dateWindowFilter, exactDateFilter, pinnedOnlyFilter, labelFilterId) {
         expenses.filter { exp ->
             val matchStatus = statusFilter == null || (exp.entryType == EntryType.EXPENSE && exp.status == statusFilter)
             val matchEntryType = entryTypeFilter == null || exp.entryType == entryTypeFilter
             val matchMode = paymentModeFilter == null || exp.paymentMode == paymentModeFilter
             val matchDate = LedgerMath.filterByDateWindow(exp, dateWindowFilter)
+            val matchExactDate = exactDateFilter == null || exp.createdAt.startsWith(exactDateFilter) || exp.dueDate == exactDateFilter
             val matchPin = !pinnedOnlyFilter || exp.isPinned
             val matchLabel = labelFilterId == null || exp.labelIds.contains(labelFilterId)
             val matchSearch = if (q.isBlank()) {
@@ -1376,7 +1642,7 @@ private fun ExpensesScreen(
                     labelHit ||
                     listHit
             }
-            matchStatus && matchEntryType && matchMode && matchDate && matchPin && matchLabel && matchSearch
+            matchStatus && matchEntryType && matchMode && matchDate && matchExactDate && matchPin && matchLabel && matchSearch
         }.sortedByDescending { it.isPinned }
     }
 
@@ -1414,8 +1680,15 @@ private fun ExpensesScreen(
                             leadingIcon = { Icon(Icons.Default.SelectAll, contentDescription = null, modifier = Modifier.size(14.dp)) },
                             label = { Text(if (bulkMode) "Cancel Select" else "Select", fontSize = 11.sp) }
                         )
+                        if (exactDateFilter != null) {
+                            FilterChip(
+                                selected = true,
+                                onClick = onClearExactDate,
+                                label = { Text("Date: $exactDateFilter ×", fontSize = 11.sp) }
+                            )
+                        }
                         FilterChip(
-                            selected = statusFilter == null && entryTypeFilter == null && paymentModeFilter == null && dateWindowFilter == DateWindowFilter.ALL && !pinnedOnlyFilter,
+                            selected = statusFilter == null && entryTypeFilter == null && paymentModeFilter == null && dateWindowFilter == DateWindowFilter.ALL && exactDateFilter == null && !pinnedOnlyFilter,
                             onClick = onClearFilters,
                             label = { Text("All (${expenses.size})", fontSize = 11.sp) }
                         )
@@ -1724,6 +1997,18 @@ private fun ExpensesScreen(
                                     .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.1f), RoundedCornerShape(6.dp))
                                     .padding(horizontal = 7.dp, vertical = 2.dp)
                             )
+                            if (exp.splitShares.isNotEmpty()) {
+                                val splitSum = exp.splitShares.sumOf { it.amount }
+                                Text(
+                                    text = "Split ₹${LedgerMath.formatDisplayAmt(splitSum, hideBalances)}",
+                                    fontSize = 10.sp,
+                                    fontWeight = FontWeight.SemiBold,
+                                    color = Color(0xFF7C3AED),
+                                    modifier = Modifier
+                                        .background(Color(0xFF7C3AED).copy(alpha = 0.1f), RoundedCornerShape(6.dp))
+                                        .padding(horizontal = 7.dp, vertical = 2.dp)
+                                )
+                            }
                             if (exp.isPinned) {
                                 Text(
                                     text = "PINNED",
@@ -2119,15 +2404,17 @@ private fun ExpenseEditorDialog(
     initialDueDate: String,
     initialLabelIds: List<String>,
     initialAttachedListIds: List<String>,
+    initialSplitShares: List<ExpenseSplitShare> = emptyList(),
     calcFormula: String?,
     receiptAttachment: ReceiptAttachmentRecord?,
     expensesHistory: List<ExpenseRecord>,
+    autoRules: List<AutoLabelRule> = emptyList(),
     labels: List<LabelRecord>,
     lists: List<ListNoteRecord>,
     onPickReceiptPhoto: () -> Unit,
     onClearReceiptPhoto: () -> Unit,
     onDismiss: () -> Unit,
-    onSave: (Double, String, ExpenseStatus, List<String>, List<String>, Boolean, RecurrenceCycle, EntryType, PaymentMode, Boolean, String) -> Unit
+    onSave: (Double, String, ExpenseStatus, List<String>, List<String>, Boolean, RecurrenceCycle, EntryType, PaymentMode, Boolean, String, List<ExpenseSplitShare>) -> Unit
 ) {
     var balanceText by remember { mutableStateOf(initialBalance) }
     var quoteText by remember { mutableStateOf(initialQuote) }
@@ -2138,6 +2425,9 @@ private fun ExpenseEditorDialog(
     var dueDateText by remember { mutableStateOf(existing?.dueDate ?: initialDueDate) }
     var selectedLabels by remember { mutableStateOf(initialLabelIds.toSet()) }
     var attachedListIds by remember { mutableStateOf(initialAttachedListIds.toSet()) }
+    var splitShares by remember { mutableStateOf(existing?.splitShares ?: initialSplitShares) }
+    var splitFriendInput by remember { mutableStateOf("") }
+    var splitAmtInput by remember { mutableStateOf("") }
     var saveAsTemplate by remember { mutableStateOf(false) }
     var recurrence by remember { mutableStateOf(RecurrenceCycle.MONTHLY) }
     var showSmsPaste by remember { mutableStateOf(false) }
@@ -2146,6 +2436,12 @@ private fun ExpenseEditorDialog(
 
     val merchantSuggestions = remember(existing, quoteText, expensesHistory) {
         if (existing != null) emptyList() else LedgerMath.suggestMerchants(expensesHistory, quoteText, 4)
+    }
+    val ruleMatch = remember(quoteText, autoRules, selectedLabels, paymentMode) {
+        LedgerMath.applyAutoLabelRules(quoteText, autoRules, selectedLabels.toList(), paymentMode)
+    }
+    val hasUnappliedRuleLabels = remember(ruleMatch, selectedLabels) {
+        ruleMatch.first.any { !selectedLabels.contains(it) }
     }
 
     AlertDialog(
@@ -2193,9 +2489,17 @@ private fun ExpenseEditorDialog(
                                                 balanceText = formatAmount(parsed.amount)
                                                 entryType = parsed.entryType
                                                 if (parsed.entryType == EntryType.INCOME) status = ExpenseStatus.PAID
-                                                paymentMode = parsed.paymentMode
+                                                var nextMode = parsed.paymentMode
                                                 if (parsed.quote.isNotBlank()) quoteText = parsed.quote
-                                                smsFeedback = "Auto-filled ₹${formatAmount(parsed.amount)} · ${parsed.paymentMode.label}"
+                                                val ruled = LedgerMath.applyAutoLabelRules(
+                                                    "${parsed.quote} $smsInput",
+                                                    autoRules,
+                                                    selectedLabels.toList(),
+                                                    nextMode
+                                                )
+                                                selectedLabels = ruled.first.toSet()
+                                                paymentMode = ruled.second
+                                                smsFeedback = "Auto-filled ₹${formatAmount(parsed.amount)} · ${paymentMode.label}"
                                             } else {
                                                 smsFeedback = "No ₹ amount detected in pasted text."
                                             }
@@ -2238,6 +2542,15 @@ private fun ExpenseEditorDialog(
                     onValueChange = { quoteText = it },
                     label = { Text("Quote / Merchant Description") }
                 )
+                if (hasUnappliedRuleLabels) {
+                    SuggestionChip(
+                        onClick = {
+                            selectedLabels = ruleMatch.first.toSet()
+                            paymentMode = ruleMatch.second
+                        },
+                        label = { Text("Apply Auto-Rule Labels & Mode", fontSize = 10.sp) }
+                    )
+                }
                 if (merchantSuggestions.isNotEmpty()) {
                     Row(
                         modifier = Modifier.horizontalScroll(rememberScrollState()),
@@ -2345,6 +2658,51 @@ private fun ExpenseEditorDialog(
                         }
                     }
                 }
+
+                if (entryType == EntryType.EXPENSE) {
+                    Text("Split with Friends (IOU · Tracked separately)", style = MaterialTheme.typography.labelMedium)
+                    splitShares.forEach { sp ->
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text("${sp.friendName} owes ₹${formatAmount(sp.amount)}", fontSize = 11.sp, fontFamily = FontFamily.Monospace)
+                            TextButton(onClick = { splitShares = splitShares.filterNot { it.id == sp.id } }) {
+                                Text("Remove", fontSize = 10.sp, color = Color(0xFFDC2626))
+                            }
+                        }
+                    }
+                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
+                        OutlinedTextField(
+                            value = splitFriendInput,
+                            onValueChange = { splitFriendInput = it },
+                            label = { Text("Friend", fontSize = 11.sp) },
+                            modifier = Modifier.weight(1f),
+                            singleLine = true
+                        )
+                        OutlinedTextField(
+                            value = splitAmtInput,
+                            onValueChange = { splitAmtInput = it },
+                            label = { Text("Share ₹", fontSize = 11.sp) },
+                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+                            modifier = Modifier.width(88.dp),
+                            singleLine = true
+                        )
+                        OutlinedButton(
+                            onClick = {
+                                val nm = splitFriendInput.trim()
+                                val a = splitAmtInput.toDoubleOrNull() ?: 0.0
+                                if (nm.isNotBlank() && a > 0.0) {
+                                    splitShares = splitShares + ExpenseSplitShare(friendName = nm, amount = a)
+                                    splitFriendInput = ""
+                                    splitAmtInput = ""
+                                }
+                            }
+                        ) { Text("Add", fontSize = 11.sp) }
+                    }
+                }
+
                 Row(
                     verticalAlignment = Alignment.CenterVertically,
                     modifier = Modifier.clickable { saveAsTemplate = !saveAsTemplate }
@@ -2385,18 +2743,25 @@ private fun ExpenseEditorDialog(
             Button(
                 onClick = {
                     val amount = balanceText.toDoubleOrNull() ?: 0.0
+                    val finalQuote = quoteText.ifBlank { if (entryType == EntryType.INCOME) "Untitled Income" else "Untitled Expense" }
+                    val autoApplied = if (existing == null && selectedLabels.isEmpty()) {
+                        LedgerMath.applyAutoLabelRules(finalQuote, autoRules, selectedLabels.toList(), paymentMode)
+                    } else {
+                        selectedLabels.toList() to paymentMode
+                    }
                     onSave(
                         amount,
-                        quoteText.ifBlank { if (entryType == EntryType.INCOME) "Untitled Income" else "Untitled Expense" },
+                        finalQuote,
                         if (entryType == EntryType.INCOME) ExpenseStatus.PAID else status,
-                        selectedLabels.toList(),
+                        autoApplied.first,
                         attachedListIds.toList(),
                         saveAsTemplate,
                         recurrence,
                         entryType,
-                        paymentMode,
+                        autoApplied.second,
                         isPinned,
-                        dueDateText
+                        dueDateText,
+                        if (entryType == EntryType.EXPENSE) splitShares else emptyList()
                     )
                 }
             ) {
@@ -2814,13 +3179,17 @@ private fun InsightsDialog(
     onUpdateOpeningBalances: (Map<PaymentMode, Double>) -> Unit,
     onCreateTransfer: (PaymentMode, PaymentMode, Double, String) -> Unit,
     onDeleteTransfer: (String) -> Unit,
+    onRecordIouRepayment: (String, Double, PaymentMode, String) -> Unit,
+    onCreateGoal: (String, Double, String) -> Unit,
+    onGoalTransaction: (String, String, Double, PaymentMode) -> Unit,
+    onOpenInternationalCalendar: () -> Unit,
     onDismiss: () -> Unit
 ) {
     val initialMonth = remember(snapshot.expenses) {
         LedgerMath.availableMonths(snapshot.expenses).firstOrNull() ?: LedgerMath.nowIso().take(7)
     }
     var monthKey by remember { mutableStateOf(initialMonth) }
-    var activeSection by remember { mutableStateOf(0) } // 0 = Budgets, 1 = Cashflow, 2 = Merchants, 3 = Calendar
+    var activeSection by remember { mutableStateOf(0) } // 0=Budgets,1=Cashflow,2=Forecast,3=Splits,4=Goals,5=Merchants,6=Calendar
     var selectedDateKey by remember { mutableStateOf<String?>(null) }
     var showOpeningEditor by remember { mutableStateOf(false) }
     var showTransferForm by remember { mutableStateOf(false) }
@@ -2833,6 +3202,16 @@ private fun InsightsDialog(
     var startCash by remember(snapshot.walletStartingBalances) { mutableStateOf(formatAmount(snapshot.walletStartingBalances[PaymentMode.CASH] ?: 0.0)) }
     var startCard by remember(snapshot.walletStartingBalances) { mutableStateOf(formatAmount(snapshot.walletStartingBalances[PaymentMode.CARD] ?: 0.0)) }
     var startBank by remember(snapshot.walletStartingBalances) { mutableStateOf(formatAmount(snapshot.walletStartingBalances[PaymentMode.BANK] ?: 0.0)) }
+
+    var repayFriend by remember { mutableStateOf("") }
+    var repayAmt by remember { mutableStateOf("") }
+    var repayWallet by remember { mutableStateOf(PaymentMode.UPI) }
+
+    var newGoalTitle by remember { mutableStateOf("") }
+    var newGoalTarget by remember { mutableStateOf("") }
+    var newGoalDate by remember { mutableStateOf("") }
+    var goalTxAmt by remember { mutableStateOf("500") }
+    var goalTxWallet by remember { mutableStateOf(PaymentMode.UPI) }
 
     val hideBalances = snapshot.hideBalances
     val monthExpenses = remember(snapshot.expenses, monthKey) {
@@ -2847,6 +3226,15 @@ private fun InsightsDialog(
     }
     val liveWallets = remember(snapshot) {
         LedgerMath.computeLiveWalletBalances(snapshot)
+    }
+    val forecast30d = remember(snapshot) {
+        LedgerMath.compute30DayForecast(snapshot)
+    }
+    val friendIous = remember(snapshot.expenses, snapshot.iouRepayments) {
+        LedgerMath.summarizeFriendIous(snapshot.expenses, snapshot.iouRepayments)
+    }
+    val goalProgress = remember(snapshot.savingsGoals, snapshot.goalTransactions) {
+        LedgerMath.computeSavingsGoalsProgress(snapshot.savingsGoals, snapshot.goalTransactions)
     }
     val merchants = remember(snapshot.expenses, monthKey) {
         LedgerMath.computeMerchantInsights(snapshot.expenses, monthKey)
@@ -2887,7 +3275,7 @@ private fun InsightsDialog(
                     modifier = Modifier.horizontalScroll(rememberScrollState()),
                     horizontalArrangement = Arrangement.spacedBy(6.dp)
                 ) {
-                    listOf("Budgets", "Cashflow", "Merchants", "Calendar").forEachIndexed { idx, label ->
+                    listOf("Budgets", "Cashflow", "Forecast", "Splits", "Goals", "Merchants", "Calendar").forEachIndexed { idx, label ->
                         FilterChip(
                             selected = activeSection == idx,
                             onClick = { activeSection = idx },
@@ -2988,7 +3376,11 @@ private fun InsightsDialog(
                                 ) {
                                     Column {
                                         Text(lw.mode.label, fontSize = 12.sp, fontWeight = FontWeight.Bold)
-                                        Text("Open ₹${LedgerMath.formatDisplayAmt(lw.startingBalance, hideBalances)} · Out -₹${LedgerMath.formatDisplayAmt(lw.cashOutflow, hideBalances)}", fontSize = 10.sp, fontFamily = FontFamily.Monospace)
+                                        Text(
+                                            text = "Open ₹${LedgerMath.formatDisplayAmt(lw.startingBalance, hideBalances)} · Out -₹${LedgerMath.formatDisplayAmt(lw.cashOutflow, hideBalances)}" + if (lw.repaymentsIn > 0.0) " · IOU +₹${LedgerMath.formatDisplayAmt(lw.repaymentsIn, hideBalances)}" else "",
+                                            fontSize = 10.sp,
+                                            fontFamily = FontFamily.Monospace
+                                        )
                                     }
                                     Text(
                                         text = "₹${LedgerMath.formatDisplayAmt(lw.liveBalance, hideBalances)}",
@@ -3075,6 +3467,170 @@ private fun InsightsDialog(
                         }
                     }
                     2 -> {
+                        Card(modifier = Modifier.fillMaxWidth()) {
+                            Column(modifier = Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                                Text("30-Day Liquidity Projection", fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                                Text(
+                                    text = "Liquid Cash: ₹${LedgerMath.formatDisplayAmt(forecast30d.liquidCash, hideBalances)}",
+                                    fontSize = 12.sp,
+                                    fontFamily = FontFamily.Monospace
+                                )
+                                Text(
+                                    text = "Projected Outflow: -₹${LedgerMath.formatDisplayAmt(forecast30d.projectedOutflow, hideBalances)}",
+                                    fontSize = 12.sp,
+                                    fontFamily = FontFamily.Monospace,
+                                    color = Color(0xFFD97706)
+                                )
+                                Text(
+                                    text = if (forecast30d.shortfallAmount > 0.0) "Shortfall: ₹${LedgerMath.formatDisplayAmt(forecast30d.shortfallAmount, hideBalances)}" else "Projected Balance: ₹${LedgerMath.formatDisplayAmt(forecast30d.projectedBalance, hideBalances)}",
+                                    fontSize = 14.sp,
+                                    fontFamily = FontFamily.Monospace,
+                                    fontWeight = FontWeight.Bold,
+                                    color = if (forecast30d.shortfallAmount > 0.0) Color(0xFFDC2626) else Color(0xFF059669)
+                                )
+                            }
+                        }
+                        Text("Upcoming Bills & Recurring Templates", fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                        if (forecast30d.items.isEmpty()) {
+                            Text("No upcoming dated bills or recurring templates within 30 days.", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        } else {
+                            forecast30d.items.forEach { item ->
+                                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                                    Text("${item.dateKey} · ${item.title}", fontSize = 11.sp, modifier = Modifier.weight(1f), maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                    Text("-₹${LedgerMath.formatDisplayAmt(item.amount, hideBalances)}", fontSize = 11.sp, fontFamily = FontFamily.Monospace, fontWeight = FontWeight.SemiBold)
+                                }
+                            }
+                        }
+                    }
+                    3 -> {
+                        Text("Split Bills & Friend IOUs", fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                        if (friendIous.isEmpty()) {
+                            Text("Add friend shares inside an expense editor to track IOUs separately.", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        } else {
+                            friendIous.forEach { iou ->
+                                Card(modifier = Modifier.fillMaxWidth()) {
+                                    Column(modifier = Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                                        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                                            Text("${iou.friendName} (${iou.itemCount} splits)", fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                                            Text(
+                                                text = if (iou.outstanding > 0.0) "Owes ₹${LedgerMath.formatDisplayAmt(iou.outstanding, hideBalances)}" else "Settled",
+                                                fontSize = 12.sp,
+                                                fontFamily = FontFamily.Monospace,
+                                                fontWeight = FontWeight.Bold,
+                                                color = if (iou.outstanding > 0.0) Color(0xFFD97706) else Color(0xFF059669)
+                                            )
+                                        }
+                                        Text(
+                                            text = "Shared ₹${LedgerMath.formatDisplayAmt(iou.totalShared, hideBalances)} · Repaid ₹${LedgerMath.formatDisplayAmt(iou.totalRepaid, hideBalances)}",
+                                            fontSize = 10.sp,
+                                            fontFamily = FontFamily.Monospace
+                                        )
+                                        if (iou.outstanding > 0.0) {
+                                            OutlinedButton(
+                                                onClick = {
+                                                    repayFriend = iou.friendName
+                                                    repayAmt = formatAmount(iou.outstanding)
+                                                },
+                                                contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp)
+                                            ) { Text("Settle IOU", fontSize = 10.sp) }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if (repayFriend.isNotBlank()) {
+                            HorizontalDivider()
+                            Text("Record Repayment from $repayFriend", fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                            OutlinedTextField(
+                                value = repayAmt,
+                                onValueChange = { repayAmt = it },
+                                label = { Text("Repaid Amount (₹)") },
+                                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+                                singleLine = true
+                            )
+                            Row(modifier = Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                PaymentMode.entries.forEach { m ->
+                                    FilterChip(selected = repayWallet == m, onClick = { repayWallet = m }, label = { Text(m.label, fontSize = 10.sp) })
+                                }
+                            }
+                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                Button(onClick = {
+                                    val amt = repayAmt.toDoubleOrNull() ?: 0.0
+                                    if (amt > 0.0) {
+                                        onRecordIouRepayment(repayFriend, amt, repayWallet, "IOU repayment")
+                                        repayFriend = ""
+                                        repayAmt = ""
+                                    }
+                                }) { Text("Credit Wallet", fontSize = 11.sp) }
+                                TextButton(onClick = { repayFriend = "" }) { Text("Cancel", fontSize = 11.sp) }
+                            }
+                        }
+                    }
+                    4 -> {
+                        Text("Savings Goals & Sinking Funds", fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                        goalProgress.forEach { gp ->
+                            Card(modifier = Modifier.fillMaxWidth()) {
+                                Column(modifier = Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                                    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                                        Text(gp.goal.title, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                                        Text("${gp.pct}%", fontSize = 12.sp, fontFamily = FontFamily.Monospace, fontWeight = FontWeight.Bold)
+                                    }
+                                    LinearProgressIndicator(
+                                        progress = { (gp.pct / 100f).coerceIn(0f, 1f) },
+                                        modifier = Modifier.fillMaxWidth().height(6.dp).clip(RoundedCornerShape(4.dp))
+                                    )
+                                    Text(
+                                        text = "Saved ₹${LedgerMath.formatDisplayAmt(gp.savedAmount, hideBalances)} / ₹${LedgerMath.formatDisplayAmt(gp.goal.targetAmount, hideBalances)}",
+                                        fontSize = 10.sp,
+                                        fontFamily = FontFamily.Monospace
+                                    )
+                                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                        FilledTonalButton(
+                                            onClick = {
+                                                val amt = goalTxAmt.toDoubleOrNull() ?: 500.0
+                                                if (amt > 0.0) onGoalTransaction(gp.goal.id, "deposit", amt, goalTxWallet)
+                                            },
+                                            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp)
+                                        ) { Text("+ Deposit ₹$goalTxAmt", fontSize = 10.sp) }
+                                        OutlinedButton(
+                                            onClick = {
+                                                val amt = goalTxAmt.toDoubleOrNull() ?: 500.0
+                                                if (amt > 0.0) onGoalTransaction(gp.goal.id, "withdraw", amt, goalTxWallet)
+                                            },
+                                            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp)
+                                        ) { Text("Withdraw", fontSize = 10.sp) }
+                                    }
+                                }
+                            }
+                        }
+                        OutlinedTextField(
+                            value = goalTxAmt,
+                            onValueChange = { goalTxAmt = it },
+                            label = { Text("Deposit / Withdraw Amount (₹)") },
+                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+                            singleLine = true
+                        )
+                        Row(modifier = Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                            PaymentMode.entries.forEach { m ->
+                                FilterChip(selected = goalTxWallet == m, onClick = { goalTxWallet = m }, label = { Text(m.label, fontSize = 10.sp) })
+                            }
+                        }
+                        HorizontalDivider()
+                        Text("New Savings Goal", fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                        OutlinedTextField(value = newGoalTitle, onValueChange = { newGoalTitle = it }, label = { Text("Goal Title") }, singleLine = true)
+                        OutlinedTextField(value = newGoalTarget, onValueChange = { newGoalTarget = it }, label = { Text("Target Amount (₹)") }, singleLine = true, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal))
+                        OutlinedTextField(value = newGoalDate, onValueChange = { newGoalDate = it }, label = { Text("Target Date (YYYY-MM-DD · Optional)") }, singleLine = true)
+                        Button(onClick = {
+                            val tAmt = newGoalTarget.toDoubleOrNull() ?: 0.0
+                            if (newGoalTitle.isNotBlank() && tAmt > 0.0) {
+                                onCreateGoal(newGoalTitle, tAmt, newGoalDate)
+                                newGoalTitle = ""
+                                newGoalTarget = ""
+                                newGoalDate = ""
+                            }
+                        }) { Text("Add Goal", fontSize = 11.sp) }
+                    }
+                    5 -> {
                         Text("Most Frequent Merchants", fontSize = 12.sp, fontWeight = FontWeight.Bold)
                         if (merchants.isEmpty()) {
                             Text("No expenses logged for $monthKey.", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
@@ -3106,6 +3662,14 @@ private fun InsightsDialog(
                         }
                     }
                     else -> {
+                        FilledTonalButton(
+                            onClick = onOpenInternationalCalendar,
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Icon(Icons.Default.CalendarMonth, contentDescription = null, modifier = Modifier.size(16.dp))
+                            Spacer(Modifier.width(6.dp))
+                            Text("Open Full International Calendar", fontSize = 12.sp)
+                        }
                         val (firstWeekdayMon0, cells) = calendarPair
                         val totalSlots = firstWeekdayMon0 + cells.size
                         val rowCount = (totalSlots + 6) / 7
@@ -3297,7 +3861,11 @@ private fun PrivacyPinDialog(
     onToggleHideBalances: (Boolean) -> Unit,
     onToggleBiometric: (Boolean) -> Unit,
     onChangeThemeMode: (ThemeMode) -> Unit,
+    onChangeAutoLock: (Int) -> Unit,
     onToggleDueReminders: (Boolean) -> Unit,
+    onOpenAutoRules: () -> Unit,
+    onExportEbak: () -> Unit,
+    onImportEbak: () -> Unit,
     onSetPin: (String) -> Unit,
     onRemovePin: () -> Unit,
     onLockNow: () -> Unit
@@ -3339,6 +3907,17 @@ private fun PrivacyPinDialog(
                     }
                 }
 
+                Text("Auto-Lock Timeout", fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+                Row(modifier = Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    listOf("Off" to 0, "30s" to 30, "1m" to 60, "5m" to 300).forEach { (lbl, secs) ->
+                        FilterChip(
+                            selected = snapshot.autoLockSeconds == secs,
+                            onClick = { onChangeAutoLock(secs) },
+                            label = { Text(lbl, fontSize = 11.sp) }
+                        )
+                    }
+                }
+
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.SpaceBetween,
@@ -3349,6 +3928,18 @@ private fun PrivacyPinDialog(
                         Text("WorkManager local alerts for unpaid bills", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
                     }
                     Switch(checked = snapshot.dueRemindersEnabled, onCheckedChange = onToggleDueReminders)
+                }
+
+                OutlinedButton(onClick = onOpenAutoRules, modifier = Modifier.fillMaxWidth()) {
+                    Text("Auto-Label Rules (${snapshot.autoLabelRules.size})", fontSize = 12.sp)
+                }
+                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OutlinedButton(onClick = onExportEbak, modifier = Modifier.weight(1f)) {
+                        Text("Export .ebak", fontSize = 11.sp)
+                    }
+                    OutlinedButton(onClick = onImportEbak, modifier = Modifier.weight(1f)) {
+                        Text("Restore .ebak", fontSize = 11.sp)
+                    }
                 }
 
                 HorizontalDivider()
@@ -3449,13 +4040,14 @@ private fun PrivacyPinDialog(
 private fun CsvImportDialog(
     initialCsvText: String,
     existingLabels: List<LabelRecord>,
+    autoRules: List<AutoLabelRule> = emptyList(),
     onPickFile: () -> Unit,
     onDismiss: () -> Unit,
     onConfirmImport: (List<ExpenseRecord>, List<LabelRecord>) -> Unit
 ) {
     var csvText by remember(initialCsvText) { mutableStateOf(initialCsvText) }
-    val preview = remember(csvText, existingLabels) {
-        if (csvText.isBlank()) null else LedgerMath.parseCsvImport(csvText, existingLabels)
+    val preview = remember(csvText, existingLabels, autoRules) {
+        if (csvText.isBlank()) null else LedgerMath.parseCsvImport(csvText, existingLabels, autoRules)
     }
 
     AlertDialog(
@@ -3727,4 +4319,353 @@ private fun PinLockOverlay(
             }
         }
     }
+}
+
+@Composable
+private fun InternationalCalendarDialog(
+    appName: String,
+    snapshot: LedgerSnapshot,
+    onUpdatePrefs: (CalendarPreferences) -> Unit,
+    onLogOnDate: (String) -> Unit,
+    onFilterFeedByDate: (String) -> Unit,
+    onPartialPay: (ExpenseRecord) -> Unit,
+    onLogTemplateNow: (ExpenseTemplateRecord) -> Unit,
+    onShareIcs: (String) -> Unit,
+    onDismiss: () -> Unit
+) {
+    val initialMonth = remember(snapshot.expenses) {
+        LedgerMath.availableMonths(snapshot.expenses).firstOrNull() ?: LedgerMath.nowIso().take(7)
+    }
+    var monthKey by remember { mutableStateOf(initialMonth) }
+    var prefs by remember(snapshot.calendarPrefs) { mutableStateOf(snapshot.calendarPrefs) }
+    val monthGrid = remember(snapshot, monthKey, prefs) {
+        LedgerMath.buildInternationalCalendarMonth(snapshot, monthKey, prefs)
+    }
+    var selectedDateKey by remember(monthKey) {
+        mutableStateOf(
+            monthGrid.cells.firstOrNull {
+                it.expenses.isNotEmpty() || it.dueBills.isNotEmpty() || it.holidays.isNotEmpty()
+            }?.dateKey ?: monthGrid.cells.firstOrNull()?.dateKey ?: "$monthKey-01"
+        )
+    }
+    val selectedCell = monthGrid.cells.firstOrNull { it.dateKey == selectedDateKey }
+    val hideBalances = snapshot.hideBalances
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = {
+            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                Text("International Calendar", fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                TextButton(onClick = { onShareIcs(LedgerMath.generateBillsIcsCalendar(snapshot, appName)) }) {
+                    Text(".ics", fontSize = 11.sp)
+                }
+            }
+        },
+        text = {
+            Column(
+                modifier = Modifier.verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    IconButton(onClick = { monthKey = LedgerMath.stepMonthKey(monthKey, -1) }) {
+                        Icon(Icons.Default.ChevronLeft, contentDescription = "Previous month")
+                    }
+                    Text(monthKey, fontFamily = FontFamily.Monospace, fontWeight = FontWeight.Bold, fontSize = 15.sp)
+                    IconButton(onClick = { monthKey = LedgerMath.stepMonthKey(monthKey, 1) }) {
+                        Icon(Icons.Default.ChevronRight, contentDescription = "Next month")
+                    }
+                }
+
+                Row(modifier = Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    CalendarWeekStart.entries.forEach { ws ->
+                        FilterChip(
+                            selected = prefs.weekStart == ws,
+                            onClick = {
+                                val next = prefs.copy(weekStart = ws)
+                                prefs = next
+                                onUpdatePrefs(next)
+                            },
+                            label = { Text(ws.label, fontSize = 10.sp) }
+                        )
+                    }
+                    FilterChip(
+                        selected = prefs.showIsoWeeks,
+                        onClick = {
+                            val next = prefs.copy(showIsoWeeks = !prefs.showIsoWeeks)
+                            prefs = next
+                            onUpdatePrefs(next)
+                        },
+                        label = { Text("ISO Wk", fontSize = 10.sp) }
+                    )
+                }
+
+                Row(modifier = Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    CalendarRegionCode.entries.forEach { reg ->
+                        FilterChip(
+                            selected = prefs.region == reg,
+                            onClick = {
+                                val next = prefs.copy(region = reg)
+                                prefs = next
+                                onUpdatePrefs(next)
+                            },
+                            label = { Text(reg.label, fontSize = 10.sp) }
+                        )
+                    }
+                }
+
+                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(2.dp)) {
+                    if (prefs.showIsoWeeks) {
+                        Text("Wk", fontSize = 9.sp, fontWeight = FontWeight.Bold, modifier = Modifier.width(24.dp), color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                    monthGrid.weekHeaders.forEach { h ->
+                        Text(h.take(2), fontSize = 9.sp, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f), textAlign = TextAlign.Center, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                }
+
+                val rowCount = (monthGrid.leadingBlanks + monthGrid.cells.size + 6) / 7
+                for (r in 0 until rowCount) {
+                    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(2.dp), verticalAlignment = Alignment.CenterVertically) {
+                        if (prefs.showIsoWeeks) {
+                            val wk = monthGrid.rowWeekNumbers.getOrNull(r) ?: 1
+                            Text("W$wk", fontSize = 8.sp, fontFamily = FontFamily.Monospace, modifier = Modifier.width(24.dp), color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        }
+                        for (c in 0 until 7) {
+                            val idx = r * 7 + c - monthGrid.leadingBlanks
+                            if (idx < 0 || idx >= monthGrid.cells.size) {
+                                Spacer(modifier = Modifier.weight(1f).height(38.dp))
+                            } else {
+                                val cell = monthGrid.cells[idx]
+                                val picked = cell.dateKey == selectedDateKey
+                                Surface(
+                                    modifier = Modifier
+                                        .weight(1f)
+                                        .height(38.dp)
+                                        .clickable { selectedDateKey = cell.dateKey },
+                                    shape = RoundedCornerShape(6.dp),
+                                    color = when {
+                                        picked -> MaterialTheme.colorScheme.primary.copy(alpha = 0.22f)
+                                        cell.dueBills.isNotEmpty() -> Color(0xFFFEF3C7)
+                                        cell.expenseTotal > 0.0 -> Color(0xFFDBEAFE)
+                                        else -> MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.35f)
+                                    }
+                                ) {
+                                    Column(modifier = Modifier.padding(2.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center) {
+                                        Text("${cell.day}", fontSize = 10.sp, fontWeight = FontWeight.Bold)
+                                        if (cell.holidays.isNotEmpty()) {
+                                            Text("★", fontSize = 8.sp, color = Color(0xFF7C3AED))
+                                        } else if (cell.expenseTotal > 0.0) {
+                                            Text("₹${LedgerMath.formatDisplayAmt(cell.expenseTotal, hideBalances)}", fontSize = 7.sp, maxLines = 1)
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if (selectedCell != null) {
+                    Card(modifier = Modifier.fillMaxWidth()) {
+                        Column(modifier = Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                            Text("Day Agenda · ${selectedCell.dateKey}", fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                FilledTonalButton(onClick = { onLogOnDate(selectedCell.dateKey) }, contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp)) {
+                                    Text("+ Log on Date", fontSize = 10.sp)
+                                }
+                                OutlinedButton(onClick = { onFilterFeedByDate(selectedCell.dateKey) }, contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp)) {
+                                    Text("Filter Feed", fontSize = 10.sp)
+                                }
+                            }
+                            selectedCell.holidays.forEach { h ->
+                                Text("★ ${h.name} (${h.region.label})", fontSize = 11.sp, color = Color(0xFF7C3AED), fontWeight = FontWeight.SemiBold)
+                            }
+                            selectedCell.dueBills.forEach { bill ->
+                                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                                    Text("Due: ${bill.quote} · ₹${LedgerMath.formatDisplayAmt(LedgerMath.expenseRemainingPart(bill), hideBalances)}", fontSize = 11.sp, modifier = Modifier.weight(1f))
+                                    TextButton(onClick = { onPartialPay(bill) }) { Text("Pay Part", fontSize = 10.sp) }
+                                }
+                            }
+                            selectedCell.projectedTemplates.forEach { tpl ->
+                                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                                    Text("Recurring: ${tpl.title} · ₹${LedgerMath.formatDisplayAmt(tpl.balance, hideBalances)}", fontSize = 11.sp, modifier = Modifier.weight(1f))
+                                    TextButton(onClick = { onLogTemplateNow(tpl) }) { Text("Log Now", fontSize = 10.sp) }
+                                }
+                            }
+                            selectedCell.expenses.forEach { e ->
+                                Text("• ${e.entryType.label}: ${e.quote} — ₹${LedgerMath.formatDisplayAmt(e.balance, hideBalances)}", fontSize = 11.sp)
+                            }
+                            selectedCell.transfers.forEach { trf ->
+                                Text("⇄ Transfer: ${trf.fromMode.label} → ${trf.toMode.label} ₹${LedgerMath.formatDisplayAmt(trf.amount, hideBalances)}", fontSize = 11.sp)
+                            }
+                            selectedCell.repayments.forEach { rep ->
+                                Text("✓ IOU Repaid (${rep.friendName}): ₹${LedgerMath.formatDisplayAmt(rep.amount, hideBalances)}", fontSize = 11.sp, color = Color(0xFF059669))
+                            }
+                            selectedCell.goalTargets.forEach { g ->
+                                Text("◎ Goal Target: ${g.title} (₹${LedgerMath.formatDisplayAmt(g.targetAmount, hideBalances)})", fontSize = 11.sp, color = Color(0xFF059669))
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = onDismiss) { Text("Close") }
+        }
+    )
+}
+
+@Composable
+private fun AutoRulesDialog(
+    rules: List<AutoLabelRule>,
+    labels: List<LabelRecord>,
+    onSaveRules: (List<AutoLabelRule>) -> Unit,
+    onDismiss: () -> Unit
+) {
+    var draftRules by remember(rules) { mutableStateOf(rules) }
+    var keywordText by remember { mutableStateOf("") }
+    var pickedLabelId by remember { mutableStateOf(labels.firstOrNull()?.id ?: "") }
+    var pickedMode by remember { mutableStateOf<PaymentMode?>(null) }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Auto-Label Rules") },
+        text = {
+            Column(
+                modifier = Modifier.verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Text("Match keywords in SMS, quotes, or CSV rows to auto-apply #Labels and default wallet.", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                OutlinedTextField(
+                    value = keywordText,
+                    onValueChange = { keywordText = it },
+                    label = { Text("Keyword (e.g. clinic, swiggy)") },
+                    singleLine = true
+                )
+                Row(modifier = Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    labels.forEach { lbl ->
+                        FilterChip(
+                            selected = pickedLabelId == lbl.id,
+                            onClick = { pickedLabelId = lbl.id },
+                            label = { Text(lbl.name, fontSize = 10.sp) }
+                        )
+                    }
+                }
+                Row(modifier = Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    FilterChip(selected = pickedMode == null, onClick = { pickedMode = null }, label = { Text("Any Mode", fontSize = 10.sp) })
+                    PaymentMode.entries.forEach { m ->
+                        FilterChip(selected = pickedMode == m, onClick = { pickedMode = m }, label = { Text(m.label, fontSize = 10.sp) })
+                    }
+                }
+                Button(
+                    onClick = {
+                        val kw = keywordText.trim()
+                        if (kw.isNotBlank() && pickedLabelId.isNotBlank()) {
+                            draftRules = listOf(AutoLabelRule(keyword = kw, labelIds = listOf(pickedLabelId), defaultPaymentMode = pickedMode, enabled = true)) + draftRules
+                            keywordText = ""
+                        }
+                    }
+                ) { Text("Add Rule", fontSize = 11.sp) }
+
+                HorizontalDivider()
+                draftRules.forEach { r ->
+                    val lblName = labels.firstOrNull { r.labelIds.contains(it.id) }?.name ?: "#Label"
+                    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text("Keyword '${r.keyword}' → $lblName" + (r.defaultPaymentMode?.let { " · ${it.label}" } ?: ""), fontSize = 11.sp, fontWeight = FontWeight.SemiBold)
+                        }
+                        Switch(
+                            checked = r.enabled,
+                            onCheckedChange = { chk ->
+                                draftRules = draftRules.map { if (it.id == r.id) it.copy(enabled = chk) else it }
+                            }
+                        )
+                        TextButton(onClick = { draftRules = draftRules.filterNot { it.id == r.id } }) {
+                            Text("Del", fontSize = 10.sp, color = Color(0xFFDC2626))
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            Button(onClick = {
+                onSaveRules(draftRules)
+                onDismiss()
+            }) { Text("Save Rules") }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("Cancel") }
+        }
+    )
+}
+
+@Composable
+private fun EncryptedBackupDialog(
+    mode: String,
+    onDismiss: () -> Unit,
+    onExportPassphrase: (String) -> Unit,
+    onDecryptPassphrase: (String) -> Boolean
+) {
+    var passphrase by remember { mutableStateOf("") }
+    var confirmPass by remember { mutableStateOf("") }
+    var errorMsg by remember { mutableStateOf<String?>(null) }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(if (mode == "export") "Export Encrypted .ebak" else "Decrypt & Restore .ebak") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text(
+                    text = "Uses PBKDF2-HMAC-SHA256 (100k rounds) + AES-256-GCM encryption compatible across Android and Web Simulator.",
+                    fontSize = 11.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                OutlinedTextField(
+                    value = passphrase,
+                    onValueChange = { passphrase = it; errorMsg = null },
+                    label = { Text("Backup Passphrase") },
+                    visualTransformation = PasswordVisualTransformation(),
+                    singleLine = true
+                )
+                if (mode == "export") {
+                    OutlinedTextField(
+                        value = confirmPass,
+                        onValueChange = { confirmPass = it; errorMsg = null },
+                        label = { Text("Confirm Passphrase") },
+                        visualTransformation = PasswordVisualTransformation(),
+                        singleLine = true
+                    )
+                }
+                if (!errorMsg.isNullOrBlank()) {
+                    Text(errorMsg!!, fontSize = 11.sp, color = Color(0xFFDC2626))
+                }
+            }
+        },
+        confirmButton = {
+            Button(onClick = {
+                if (passphrase.trim().length < 4) {
+                    errorMsg = "Enter a passphrase of at least 4 characters."
+                    return@Button
+                }
+                if (mode == "export") {
+                    if (passphrase != confirmPass) {
+                        errorMsg = "Passphrases do not match."
+                        return@Button
+                    }
+                    onExportPassphrase(passphrase)
+                } else {
+                    if (!onDecryptPassphrase(passphrase)) {
+                        errorMsg = "Incorrect passphrase or corrupted .ebak archive."
+                    }
+                }
+            }) {
+                Text(if (mode == "export") "Save .ebak File" else "Decrypt & Restore")
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("Cancel") }
+        }
+    )
 }
