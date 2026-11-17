@@ -125,6 +125,63 @@ object LedgerMath {
         }
         return kotlin.math.round(sum * 100.0) / 100.0
     }
+
+    fun formatAmt(value: Double): String {
+        val rounded = kotlin.math.round(value * 100.0) / 100.0
+        return if (rounded % 1.0 == 0.0) {
+            rounded.toLong().toString()
+        } else {
+            String.format(Locale.US, "%.2f", rounded)
+        }
+    }
+
+    fun availableMonths(expenses: List<ExpenseRecord>): List<String> {
+        val monthRegex = Regex("""^\d{4}-\d{2}$""")
+        return expenses
+            .mapNotNull { exp ->
+                val prefix = exp.createdAt.take(7)
+                if (monthRegex.matches(prefix)) prefix else null
+            }
+            .distinct()
+            .sortedDescending()
+    }
+
+    fun buildShareSummary(
+        snapshot: LedgerSnapshot,
+        appName: String,
+        labelId: String?,
+        monthKey: String?
+    ): String {
+        val targetLabel = labelId?.let { id -> snapshot.labels.firstOrNull { it.id == id } }
+        val filtered = snapshot.expenses.filter { exp ->
+            val matchLabel = targetLabel == null || exp.labelIds.contains(targetLabel.id)
+            val matchMonth = monthKey.isNullOrBlank() || exp.createdAt.startsWith(monthKey)
+            matchLabel && matchMonth
+        }
+        val paid = filtered.filter { it.status == ExpenseStatus.PAID }.sumOf { it.balance }
+        val hold = filtered.filter { it.status == ExpenseStatus.HOLD }.sumOf { it.balance }
+        val need = filtered.filter { it.status == ExpenseStatus.NEED }.sumOf { it.balance }
+        val total = paid + hold + need
+        val scopeName = targetLabel?.name ?: "All Expenses"
+        val periodName = if (monthKey.isNullOrBlank()) "All Time" else monthKey
+
+        return buildString {
+            appendLine("$appName — Ledger Summary")
+            appendLine("Scope: $scopeName · Period: $periodName")
+            appendLine("Paid: ₹${formatAmt(paid)} | Hold: ₹${formatAmt(hold)} | Need: ₹${formatAmt(need)}")
+            appendLine("Grand Commitment: ₹${formatAmt(total)} (${filtered.size} entries)")
+            appendLine("---")
+            if (filtered.isEmpty()) {
+                appendLine("No matching expense entries.")
+            } else {
+                filtered.forEachIndexed { idx, exp ->
+                    val tagNames = exp.labelIds.mapNotNull { id -> snapshot.labels.firstOrNull { it.id == id }?.name }
+                    val tagSuffix = if (tagNames.isNotEmpty()) " [" + tagNames.joinToString(", ") + "]" else ""
+                    appendLine("${idx + 1}. [${exp.status.label.uppercase()}] ₹${formatAmt(exp.balance)} — ${exp.quote}$tagSuffix")
+                }
+            }
+        }.trimEnd()
+    }
 }
 
 class LedgerDbHelper(context: Context) : SQLiteOpenHelper(context, "expense_ledger.db", null, 1) {
@@ -373,6 +430,30 @@ class LedgerDbHelper(context: Context) : SQLiteOpenHelper(context, "expense_ledg
             LedgerSnapshot(expenses, labels, lists, calcHistory)
         } catch (_: Exception) {
             createSeedSnapshot()
+        }
+    }
+
+    fun validateBackupJson(rawJson: String): LedgerSnapshot? {
+        return try {
+            val root = JSONObject(rawJson)
+            if (root.optJSONArray("expenses") == null ||
+                root.optJSONArray("labels") == null ||
+                root.optJSONArray("lists") == null
+            ) {
+                return null
+            }
+            val parsed = decodeSnapshot(rawJson)
+            val validLabelIds = parsed.labels.map { it.id }.toSet()
+            val validListIds = parsed.lists.map { it.id }.toSet()
+            val normalizedExpenses = parsed.expenses.map { exp ->
+                exp.copy(
+                    labelIds = exp.labelIds.filter { validLabelIds.contains(it) },
+                    attachedListIds = exp.attachedListIds.filter { validListIds.contains(it) }
+                )
+            }
+            parsed.copy(expenses = normalizedExpenses)
+        } catch (_: Exception) {
+            null
         }
     }
 

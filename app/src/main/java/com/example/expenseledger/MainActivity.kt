@@ -1,9 +1,12 @@
 package com.example.expenseledger
 
+import android.content.Intent
 import android.content.res.Configuration
 import android.os.Bundle
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -32,6 +35,7 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import kotlinx.coroutines.launch
 import kotlin.math.round
 
 class MainActivity : ComponentActivity() {
@@ -101,9 +105,69 @@ fun ExpenseLedgerApp() {
 
     var showCalculatorSheet by remember { mutableStateOf(false) }
 
+    // v1.1 Controls: Search & Filter, Undo Snackbar, Backup/Restore, Share Summary
+    var searchQuery by remember { mutableStateOf("") }
+    var statusFilter by remember { mutableStateOf<ExpenseStatus?>(null) }
+    var labelFilterId by remember { mutableStateOf<String?>(null) }
+    var showOverflowMenu by remember { mutableStateOf(false) }
+    var showShareDialog by remember { mutableStateOf(false) }
+    var shareLabelId by remember { mutableStateOf<String?>(null) }
+
+    val snackbarHostState = remember { SnackbarHostState() }
+    val coroutineScope = rememberCoroutineScope()
+
     fun persist(updated: LedgerSnapshot) {
         snapshot = updated
         dbHelper.saveSnapshot(updated)
+    }
+
+    fun showActionSnackbar(message: String, undoSnapshot: LedgerSnapshot? = null) {
+        coroutineScope.launch {
+            snackbarHostState.currentSnackbarData?.dismiss()
+            val result = snackbarHostState.showSnackbar(
+                message = message,
+                actionLabel = if (undoSnapshot != null) "Undo" else null,
+                duration = SnackbarDuration.Short
+            )
+            if (result == SnackbarResult.ActionPerformed && undoSnapshot != null) {
+                persist(undoSnapshot)
+            }
+        }
+    }
+
+    val exportBackupLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.CreateDocument("application/json")
+    ) { uri ->
+        if (uri != null) {
+            try {
+                context.contentResolver.openOutputStream(uri)?.use { stream ->
+                    stream.write(dbHelper.encodeSnapshot(snapshot).toByteArray(Charsets.UTF_8))
+                }
+                showActionSnackbar("Exported JSON backup")
+            } catch (_: Exception) {
+                showActionSnackbar("Could not export JSON backup")
+            }
+        }
+    }
+
+    val importBackupLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocument()
+    ) { uri ->
+        if (uri != null) {
+            try {
+                val raw = context.contentResolver.openInputStream(uri)?.bufferedReader()?.use { it.readText() } ?: ""
+                val restored = dbHelper.validateBackupJson(raw)
+                if (restored != null) {
+                    val prev = snapshot
+                    persist(restored)
+                    showActionSnackbar("Restored ${restored.expenses.size} expenses from JSON", prev)
+                } else {
+                    showActionSnackbar("Invalid ledger backup JSON file")
+                }
+            } catch (_: Exception) {
+                showActionSnackbar("Failed to read backup file")
+            }
+        }
     }
 
     // Isolated Anti-Double-Counting Totals calculated directly from Expenses
@@ -126,6 +190,7 @@ fun ExpenseLedgerApp() {
 
     MaterialTheme(colorScheme = colorScheme) {
         Scaffold(
+            snackbarHost = { SnackbarHost(hostState = snackbarHostState) },
             topBar = {
                 Column(
                     modifier = Modifier
@@ -143,7 +208,7 @@ fun ExpenseLedgerApp() {
                             style = MaterialTheme.typography.titleMedium,
                             fontWeight = FontWeight.Bold
                         )
-                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Row(horizontalArrangement = Arrangement.spacedBy(4.dp), verticalAlignment = Alignment.CenterVertically) {
                             IconButton(onClick = { isDark = !isDark }) {
                                 Icon(
                                     imageVector = if (isDark) Icons.Default.LightMode else Icons.Default.DarkMode,
@@ -154,6 +219,41 @@ fun ExpenseLedgerApp() {
                                 Icon(Icons.Default.Calculate, contentDescription = null, modifier = Modifier.size(16.dp))
                                 Spacer(Modifier.width(6.dp))
                                 Text("Calc")
+                            }
+                            Box {
+                                IconButton(onClick = { showOverflowMenu = true }) {
+                                    Icon(Icons.Default.MoreVert, contentDescription = "Backup and share options")
+                                }
+                                DropdownMenu(
+                                    expanded = showOverflowMenu,
+                                    onDismissRequest = { showOverflowMenu = false }
+                                ) {
+                                    DropdownMenuItem(
+                                        text = { Text("Share Summary") },
+                                        leadingIcon = { Icon(Icons.Default.Share, contentDescription = null) },
+                                        onClick = {
+                                            showOverflowMenu = false
+                                            shareLabelId = null
+                                            showShareDialog = true
+                                        }
+                                    )
+                                    DropdownMenuItem(
+                                        text = { Text("Export Backup (.json)") },
+                                        leadingIcon = { Icon(Icons.Default.Download, contentDescription = null) },
+                                        onClick = {
+                                            showOverflowMenu = false
+                                            exportBackupLauncher.launch("expense-ledger-backup.json")
+                                        }
+                                    )
+                                    DropdownMenuItem(
+                                        text = { Text("Restore Backup (.json)") },
+                                        leadingIcon = { Icon(Icons.Default.Upload, contentDescription = null) },
+                                        onClick = {
+                                            showOverflowMenu = false
+                                            importBackupLauncher.launch(arrayOf("application/json", "*/*"))
+                                        }
+                                    )
+                                }
                             }
                         }
                     }
@@ -236,6 +336,17 @@ fun ExpenseLedgerApp() {
                         expenses = snapshot.expenses,
                         labels = snapshot.labels,
                         lists = snapshot.lists,
+                        searchQuery = searchQuery,
+                        statusFilter = statusFilter,
+                        labelFilterId = labelFilterId,
+                        onSearchQueryChange = { searchQuery = it },
+                        onStatusFilterChange = { statusFilter = it },
+                        onLabelFilterChange = { labelFilterId = it },
+                        onClearFilters = {
+                            searchQuery = ""
+                            statusFilter = null
+                            labelFilterId = null
+                        },
                         onCycleStatus = { exp ->
                             val now = LedgerMath.nowIso()
                             val nextStatus = exp.status.next()
@@ -265,7 +376,12 @@ fun ExpenseLedgerApp() {
                             showExpenseModal = true
                         },
                         onDelete = { expId ->
+                            val target = snapshot.expenses.firstOrNull { it.id == expId }
+                            val prev = snapshot
                             persist(snapshot.copy(expenses = snapshot.expenses.filterNot { it.id == expId }))
+                            if (target != null) {
+                                showActionSnackbar("Deleted '${target.quote}'", prev)
+                            }
                         }
                     )
                     LedgerTab.LABELS -> LabelsScreen(
@@ -276,6 +392,8 @@ fun ExpenseLedgerApp() {
                             showLabelModal = true
                         },
                         onDeleteLabel = { lblId ->
+                            val targetName = snapshot.labels.firstOrNull { it.id == lblId }?.name ?: "Label"
+                            val prev = snapshot
                             val now = LedgerMath.nowIso()
                             persist(
                                 snapshot.copy(
@@ -295,6 +413,8 @@ fun ExpenseLedgerApp() {
                                     }
                                 )
                             )
+                            if (labelFilterId == lblId) labelFilterId = null
+                            showActionSnackbar("Deleted label '$targetName'", prev)
                         },
                         onAddExpenseForLabel = { lblId ->
                             editingExpense = null
@@ -306,6 +426,10 @@ fun ExpenseLedgerApp() {
                             prefillCalcFormula = null
                             activeTab = LedgerTab.EXPENSES
                             showExpenseModal = true
+                        },
+                        onShareLabel = { lblId ->
+                            shareLabelId = lblId
+                            showShareDialog = true
                         }
                     )
                     LedgerTab.LISTS -> ListsScreen(
@@ -317,6 +441,8 @@ fun ExpenseLedgerApp() {
                             showListModal = true
                         },
                         onDeleteList = { listId ->
+                            val targetTitle = snapshot.lists.firstOrNull { it.id == listId }?.title ?: "List"
+                            val prev = snapshot
                             val now = LedgerMath.nowIso()
                             persist(
                                 snapshot.copy(
@@ -331,6 +457,7 @@ fun ExpenseLedgerApp() {
                                     }
                                 )
                             )
+                            showActionSnackbar("Deleted list '$targetTitle'", prev)
                         },
                         onUseInExpense = { lst, detectedSum ->
                             editingExpense = null
@@ -508,6 +635,23 @@ fun ExpenseLedgerApp() {
                 )
             }
         }
+
+        if (showShareDialog) {
+            ShareSummaryDialog(
+                appName = "Expense Ledger",
+                snapshot = snapshot,
+                initialLabelId = shareLabelId,
+                onDismiss = { showShareDialog = false },
+                onShareText = { summaryText ->
+                    val sendIntent = Intent(Intent.ACTION_SEND).apply {
+                        type = "text/plain"
+                        putExtra(Intent.EXTRA_TEXT, summaryText)
+                    }
+                    context.startActivity(Intent.createChooser(sendIntent, "Share Ledger Summary"))
+                    showShareDialog = false
+                }
+            )
+        }
     }
 }
 
@@ -538,16 +682,109 @@ private fun ExpensesScreen(
     expenses: List<ExpenseRecord>,
     labels: List<LabelRecord>,
     lists: List<ListNoteRecord>,
+    searchQuery: String,
+    statusFilter: ExpenseStatus?,
+    labelFilterId: String?,
+    onSearchQueryChange: (String) -> Unit,
+    onStatusFilterChange: (ExpenseStatus?) -> Unit,
+    onLabelFilterChange: (String?) -> Unit,
+    onClearFilters: () -> Unit,
     onCycleStatus: (ExpenseRecord) -> Unit,
     onEdit: (ExpenseRecord) -> Unit,
     onDelete: (String) -> Unit
 ) {
+    val q = searchQuery.trim()
+    val filteredExpenses = remember(expenses, labels, lists, q, statusFilter, labelFilterId) {
+        expenses.filter { exp ->
+            val matchStatus = statusFilter == null || exp.status == statusFilter
+            val matchLabel = labelFilterId == null || exp.labelIds.contains(labelFilterId)
+            val matchSearch = if (q.isBlank()) {
+                true
+            } else {
+                val labelHit = exp.labelIds.any { id -> labels.firstOrNull { it.id == id }?.name?.contains(q, ignoreCase = true) == true }
+                val listHit = exp.attachedListIds.any { id ->
+                    val lst = lists.firstOrNull { it.id == id }
+                    lst != null && (lst.title.contains(q, ignoreCase = true) || lst.content.contains(q, ignoreCase = true))
+                }
+                exp.quote.contains(q, ignoreCase = true) || formatAmount(exp.balance).contains(q, ignoreCase = true) || labelHit || listHit
+            }
+            matchStatus && matchLabel && matchSearch
+        }
+    }
+
     LazyColumn(
         modifier = Modifier.fillMaxSize(),
         contentPadding = PaddingValues(16.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
-        items(expenses, key = { it.id }) { exp ->
+        item(key = "expenses-filter-bar") {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedTextField(
+                    value = searchQuery,
+                    onValueChange = onSearchQueryChange,
+                    modifier = Modifier.fillMaxWidth(),
+                    singleLine = true,
+                    placeholder = { Text("Search quotes, ₹ amounts, lists...", fontSize = 13.sp) },
+                    leadingIcon = { Icon(Icons.Default.Search, contentDescription = null, modifier = Modifier.size(18.dp)) },
+                    trailingIcon = {
+                        if (searchQuery.isNotBlank()) {
+                            IconButton(onClick = { onSearchQueryChange("") }) {
+                                Icon(Icons.Default.Close, contentDescription = "Clear search", modifier = Modifier.size(18.dp))
+                            }
+                        }
+                    }
+                )
+                Row(
+                    modifier = Modifier.horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    FilterChip(
+                        selected = statusFilter == null,
+                        onClick = { onStatusFilterChange(null) },
+                        label = { Text("All (${expenses.size})", fontSize = 11.sp) }
+                    )
+                    ExpenseStatus.entries.forEach { s ->
+                        FilterChip(
+                            selected = statusFilter == s,
+                            onClick = { onStatusFilterChange(if (statusFilter == s) null else s) },
+                            label = { Text(s.label, fontSize = 11.sp) }
+                        )
+                    }
+                    labels.forEach { lbl ->
+                        FilterChip(
+                            selected = labelFilterId == lbl.id,
+                            onClick = { onLabelFilterChange(if (labelFilterId == lbl.id) null else lbl.id) },
+                            label = { Text(lbl.name, fontSize = 11.sp) }
+                        )
+                    }
+                }
+            }
+        }
+
+        if (filteredExpenses.isEmpty()) {
+            item(key = "expenses-empty-filter") {
+                Card(modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(14.dp)) {
+                    Column(
+                        modifier = Modifier.fillMaxWidth().padding(20.dp),
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Text("No matching expenses", fontWeight = FontWeight.SemiBold)
+                        Text(
+                            text = "Try clearing your search or status/label filters.",
+                            fontSize = 12.sp,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                        OutlinedButton(onClick = onClearFilters) {
+                            Text("Clear Filters")
+                        }
+                    }
+                }
+            }
+        }
+
+        items(filteredExpenses, key = { it.id }) { exp ->
             var expandAudit by remember { mutableStateOf(false) }
             val attachedLists = exp.attachedListIds.mapNotNull { id -> lists.firstOrNull { it.id == id } }
             val statusColor = when (exp.status) {
@@ -724,7 +961,8 @@ private fun LabelsScreen(
     expenses: List<ExpenseRecord>,
     onEditLabel: (LabelRecord) -> Unit,
     onDeleteLabel: (String) -> Unit,
-    onAddExpenseForLabel: (String) -> Unit
+    onAddExpenseForLabel: (String) -> Unit,
+    onShareLabel: (String) -> Unit
 ) {
     LazyColumn(
         modifier = Modifier.fillMaxSize(),
@@ -753,6 +991,9 @@ private fun LabelsScreen(
                         Row {
                             TextButton(onClick = { onAddExpenseForLabel(lbl.id) }) {
                                 Text("+ Expense")
+                            }
+                            IconButton(onClick = { onShareLabel(lbl.id) }) {
+                                Icon(Icons.Default.Share, contentDescription = "Share label summary", modifier = Modifier.size(16.dp))
                             }
                             IconButton(onClick = { onEditLabel(lbl) }) {
                                 Icon(Icons.Default.Edit, contentDescription = "Edit label", modifier = Modifier.size(16.dp))
@@ -1256,4 +1497,91 @@ private fun CalculatorSheetContent(
         }
         Spacer(Modifier.height(12.dp))
     }
+}
+
+@Composable
+private fun ShareSummaryDialog(
+    appName: String,
+    snapshot: LedgerSnapshot,
+    initialLabelId: String?,
+    onDismiss: () -> Unit,
+    onShareText: (String) -> Unit
+) {
+    var selectedLabelId by remember(initialLabelId) { mutableStateOf(initialLabelId) }
+    var selectedMonthKey by remember { mutableStateOf<String?>(null) }
+    val months = remember(snapshot.expenses) { LedgerMath.availableMonths(snapshot.expenses) }
+    val summaryText = remember(snapshot, selectedLabelId, selectedMonthKey) {
+        LedgerMath.buildShareSummary(snapshot, appName, selectedLabelId, selectedMonthKey)
+    }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Share Ledger Summary") },
+        text = {
+            Column(
+                modifier = Modifier.verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                Text("Scope", style = MaterialTheme.typography.labelMedium)
+                Row(
+                    modifier = Modifier.horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    FilterChip(
+                        selected = selectedLabelId == null,
+                        onClick = { selectedLabelId = null },
+                        label = { Text("All Expenses", fontSize = 11.sp) }
+                    )
+                    snapshot.labels.forEach { lbl ->
+                        FilterChip(
+                            selected = selectedLabelId == lbl.id,
+                            onClick = { selectedLabelId = lbl.id },
+                            label = { Text(lbl.name, fontSize = 11.sp) }
+                        )
+                    }
+                }
+
+                Text("Month", style = MaterialTheme.typography.labelMedium)
+                Row(
+                    modifier = Modifier.horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    FilterChip(
+                        selected = selectedMonthKey == null,
+                        onClick = { selectedMonthKey = null },
+                        label = { Text("All Time", fontSize = 11.sp) }
+                    )
+                    months.forEach { month ->
+                        FilterChip(
+                            selected = selectedMonthKey == month,
+                            onClick = { selectedMonthKey = month },
+                            label = { Text(month, fontSize = 11.sp) }
+                        )
+                    }
+                }
+
+                Surface(
+                    shape = RoundedCornerShape(10.dp),
+                    color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.6f)
+                ) {
+                    Text(
+                        text = summaryText,
+                        fontFamily = FontFamily.Monospace,
+                        fontSize = 11.sp,
+                        modifier = Modifier.padding(10.dp)
+                    )
+                }
+            }
+        },
+        confirmButton = {
+            Button(onClick = { onShareText(summaryText) }) {
+                Icon(Icons.Default.Share, contentDescription = null, modifier = Modifier.size(16.dp))
+                Spacer(Modifier.width(6.dp))
+                Text("Share Text")
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("Close") }
+        }
+    )
 }
