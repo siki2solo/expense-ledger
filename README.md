@@ -1,7 +1,7 @@
 # Expense Ledger (Android)
 
 Package ID: `com.example.expenseledger`
-Version: `1.5` (Code `6`)
+Version: `1.6` (Code `7`)
 
 ## Features Included
 - **Live Balance Dashboard**: Isolated `PAID (₹)`, `HOLD (₹)`, `NEED (₹)`, and Grand Commitment calculated strictly from active Expenses (with partial settlements credited live to `PAID`), plus Net Cashflow indicator when Income entries exist.

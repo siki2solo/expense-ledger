@@ -186,10 +186,13 @@ fun ExpenseLedgerApp(
     var showShareDialog by remember { mutableStateOf(false) }
     var shareLabelId by remember { mutableStateOf<String?>(null) }
 
-    // v1.2, v1.3 & v1.4 Controls: Insights, Bin, Bulk Select, Templates, Privacy/Biometrics, CSV, Partial Pay & Receipts
+    // v1.2, v1.3, v1.4, v1.5 & v1.6 Controls: Insights, Bin, Bulk Select, Templates, Privacy/Biometrics, CSV, Partial Pay, Receipts, HTML & Reset
     var showInsightsDialog by remember { mutableStateOf(false) }
+    var insightsInitialSection by remember { mutableStateOf(0) }
     var showCalendarDialog by remember { mutableStateOf(false) }
     var showAutoRulesDialog by remember { mutableStateOf(false) }
+    var showResetConfirmDialog by remember { mutableStateOf(false) }
+    var showDueBanner by remember { mutableStateOf(true) }
     var ebakDialogMode by remember { mutableStateOf<String?>(null) } // "export" | "restore"
     var pendingEbakText by remember { mutableStateOf<String?>(null) }
     var pendingEbakPassphrase by remember { mutableStateOf("") }
@@ -202,6 +205,8 @@ fun ExpenseLedgerApp(
     var receiptLightboxRecord by remember { mutableStateOf<ExpenseRecord?>(null) }
     var pendingPdfLabelId by remember { mutableStateOf<String?>(null) }
     var pendingPdfMonthKey by remember { mutableStateOf<String?>(null) }
+    var pendingHtmlLabelId by remember { mutableStateOf<String?>(null) }
+    var pendingHtmlMonthKey by remember { mutableStateOf<String?>(null) }
     var pendingCsvText by remember { mutableStateOf("") }
     var isLocked by remember { mutableStateOf(!snapshot.privacyPinHash.isNullOrBlank()) }
     var lastPausedAtMs by remember { mutableStateOf<Long?>(null) }
@@ -337,6 +342,27 @@ fun ExpenseLedgerApp(
         }
     }
 
+    val exportHtmlLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.CreateDocument("text/html")
+    ) { uri ->
+        if (uri != null) {
+            try {
+                val html = LedgerMath.buildStatementHtml(
+                    snapshot = snapshot,
+                    appName = "Expense Ledger",
+                    labelId = pendingHtmlLabelId,
+                    monthKey = pendingHtmlMonthKey
+                )
+                context.contentResolver.openOutputStream(uri)?.use { stream ->
+                    stream.write(html.toByteArray(Charsets.UTF_8))
+                }
+                showActionSnackbar("Saved HTML statement (.html)")
+            } catch (_: Exception) {
+                showActionSnackbar("Could not save HTML statement")
+            }
+        }
+    }
+
     val receiptPickerLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.PickVisualMedia()
     ) { uri ->
@@ -438,6 +464,15 @@ fun ExpenseLedgerApp(
     val cashflow = remember(snapshot.expenses) {
         LedgerMath.computeCashflowSummary(snapshot.expenses)
     }
+    val liveWallets = remember(snapshot) {
+        LedgerMath.computeLiveWalletBalances(snapshot)
+    }
+    val goalProgress = remember(snapshot.savingsGoals, snapshot.goalTransactions) {
+        LedgerMath.computeSavingsGoalsProgress(snapshot.savingsGoals, snapshot.goalTransactions)
+    }
+    val dueAlertSummary = remember(snapshot.expenses) {
+        LedgerMath.collectDueAlerts(snapshot.expenses)
+    }
 
     val sysDark = isSystemInDarkTheme()
     val isDark = when (snapshot.themeMode) {
@@ -445,11 +480,45 @@ fun ExpenseLedgerApp(
         ThemeMode.DARK -> true
         ThemeMode.SYSTEM -> sysDark
     }
-    val colorScheme = if (isDark) darkColorScheme() else lightColorScheme(
-        background = Color(0xFFF8FAFC),
-        surface = Color(0xFFFFFFFF),
-        primary = Color(0xFF1E40AF)
-    )
+    val colorScheme = if (isDark) {
+        darkColorScheme(
+            primary = Color(0xFF2563EB),
+            onPrimary = Color.White,
+            primaryContainer = Color(0xFF1E3A8A),
+            onPrimaryContainer = Color(0xFFDBEAFE),
+            secondary = Color(0xFF3B82F6),
+            onSecondary = Color.White,
+            secondaryContainer = Color(0xFF1E293B),
+            onSecondaryContainer = Color(0xFF93C5FD),
+            background = Color(0xFF020617),
+            onBackground = Color(0xFFF8FAFC),
+            surface = Color(0xFF0F172A),
+            onSurface = Color(0xFFF8FAFC),
+            surfaceVariant = Color(0xFF1E293B),
+            onSurfaceVariant = Color(0xFF94A3B8),
+            outline = Color(0xFF334155),
+            outlineVariant = Color(0xFF1E293B)
+        )
+    } else {
+        lightColorScheme(
+            primary = Color(0xFF1D4ED8),
+            onPrimary = Color.White,
+            primaryContainer = Color(0xFFDBEAFE),
+            onPrimaryContainer = Color(0xFF1E40AF),
+            secondary = Color(0xFF2563EB),
+            onSecondary = Color.White,
+            secondaryContainer = Color(0xFFEFF6FF),
+            onSecondaryContainer = Color(0xFF1D4ED8),
+            background = Color(0xFFF8FAFC),
+            onBackground = Color(0xFF0F172A),
+            surface = Color(0xFFFFFFFF),
+            onSurface = Color(0xFF0F172A),
+            surfaceVariant = Color(0xFFF1F5F9),
+            onSurfaceVariant = Color(0xFF475569),
+            outline = Color(0xFFCBD5E1),
+            outlineVariant = Color(0xFFE2E8F0)
+        )
+    }
 
     MaterialTheme(colorScheme = colorScheme) {
         Scaffold(
@@ -504,6 +573,7 @@ fun ExpenseLedgerApp(
                                         leadingIcon = { Icon(Icons.Default.BarChart, contentDescription = null) },
                                         onClick = {
                                             showOverflowMenu = false
+                                            insightsInitialSection = 0
                                             showInsightsDialog = true
                                         }
                                     )
@@ -531,13 +601,24 @@ fun ExpenseLedgerApp(
                                             showBinDialog = true
                                         }
                                     )
+                                    HorizontalDivider()
                                     DropdownMenuItem(
-                                        text = { Text("Share Summary") },
+                                        text = { Text("Share Summary & CSV / PDF") },
                                         leadingIcon = { Icon(Icons.Default.Share, contentDescription = null) },
                                         onClick = {
                                             showOverflowMenu = false
                                             shareLabelId = null
                                             showShareDialog = true
+                                        }
+                                    )
+                                    DropdownMenuItem(
+                                        text = { Text("Export Statement (.html)") },
+                                        leadingIcon = { Icon(Icons.Default.Description, contentDescription = null) },
+                                        onClick = {
+                                            showOverflowMenu = false
+                                            pendingHtmlLabelId = null
+                                            pendingHtmlMonthKey = null
+                                            exportHtmlLauncher.launch("expense-ledger-statement.html")
                                         }
                                     )
                                     DropdownMenuItem(
@@ -582,6 +663,15 @@ fun ExpenseLedgerApp(
                                             importBackupLauncher.launch(arrayOf("application/json", "*/*"))
                                         }
                                     )
+                                    HorizontalDivider()
+                                    DropdownMenuItem(
+                                        text = { Text("Reset Seed Data", color = Color(0xFFDC2626)) },
+                                        leadingIcon = { Icon(Icons.Default.RestartAlt, contentDescription = null, tint = Color(0xFFDC2626)) },
+                                        onClick = {
+                                            showOverflowMenu = false
+                                            showResetConfirmDialog = true
+                                        }
+                                    )
                                 }
                             }
                         }
@@ -620,7 +710,10 @@ fun ExpenseLedgerApp(
                             )
                         }
                         IconButton(
-                            onClick = { showInsightsDialog = true },
+                            onClick = {
+                                insightsInitialSection = 0
+                                showInsightsDialog = true
+                            },
                             modifier = Modifier.size(36.dp)
                         ) {
                             Icon(Icons.Default.BarChart, contentDescription = "Insights and cashflow", modifier = Modifier.size(20.dp))
@@ -665,16 +758,48 @@ fun ExpenseLedgerApp(
                         SummaryStatBox("NEED (₹)", needTotal, Color(0xFFDC2626), snapshot.hideBalances, Modifier.weight(1f))
                     }
                     Spacer(Modifier.height(6.dp))
-                    Text(
-                        text = "Grand Commitment: ₹${LedgerMath.formatDisplayAmt(grandTotal, snapshot.hideBalances)} · ${expenseOnly.size} exp" + if (cashflow.incomeCount > 0) " · Net ₹${LedgerMath.formatDisplayAmt(cashflow.netCashflow, snapshot.hideBalances)}" else "",
-                        style = MaterialTheme.typography.labelMedium,
-                        fontFamily = FontFamily.Monospace,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            text = "Grand Commitment",
+                            style = MaterialTheme.typography.labelSmall,
+                            fontFamily = FontFamily.Monospace,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text(
+                                text = "₹${LedgerMath.formatDisplayAmt(grandTotal, snapshot.hideBalances)} · ${expenseOnly.size} exp",
+                                style = MaterialTheme.typography.labelSmall,
+                                fontFamily = FontFamily.Monospace,
+                                fontWeight = FontWeight.Bold,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                            if (cashflow.incomeCount > 0) {
+                                Text(
+                                    text = " · Net ",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    fontFamily = FontFamily.Monospace,
+                                    fontWeight = FontWeight.Bold,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                                val netSign = if (cashflow.netCashflow >= 0.0) "+" else "-"
+                                Text(
+                                    text = "${netSign}₹${LedgerMath.formatDisplayAmt(kotlin.math.abs(cashflow.netCashflow), snapshot.hideBalances)}",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    fontFamily = FontFamily.Monospace,
+                                    fontWeight = FontWeight.Bold,
+                                    color = if (cashflow.netCashflow >= 0.0) Color(0xFF059669) else Color(0xFFDC2626)
+                                )
+                            }
+                        }
+                    }
                 }
             },
             bottomBar = {
-                NavigationBar {
+                NavigationBar(containerColor = MaterialTheme.colorScheme.surface) {
                     LedgerTab.entries.forEach { tab ->
                         val icon = when (tab) {
                             LedgerTab.LISTS -> Icons.Default.Checklist
@@ -699,6 +824,9 @@ fun ExpenseLedgerApp(
             floatingActionButton = {
                 if (!(activeTab == LedgerTab.EXPENSES && bulkMode && selectedExpenseIds.isNotEmpty())) {
                     FloatingActionButton(
+                        containerColor = MaterialTheme.colorScheme.primary,
+                        contentColor = Color.White,
+                        shape = RoundedCornerShape(16.dp),
                         onClick = {
                             when (activeTab) {
                                 LedgerTab.EXPENSES -> {
@@ -747,7 +875,13 @@ fun ExpenseLedgerApp(
                         labels = snapshot.labels,
                         lists = snapshot.lists,
                         templates = snapshot.templates,
+                        liveWallets = liveWallets,
+                        goalProgress = goalProgress,
+                        dueAlertSummary = dueAlertSummary,
+                        dueRemindersEnabled = snapshot.dueRemindersEnabled,
+                        showDueBanner = showDueBanner,
                         hideBalances = snapshot.hideBalances,
+                        isDark = isDark,
                         searchQuery = searchQuery,
                         statusFilter = statusFilter,
                         entryTypeFilter = entryTypeFilter,
@@ -759,6 +893,11 @@ fun ExpenseLedgerApp(
                         bulkMode = bulkMode,
                         selectedExpenseIds = selectedExpenseIds,
                         showQuickTemplates = showQuickTemplates,
+                        onDismissDueBanner = { showDueBanner = false },
+                        onOpenInsightsSection = { secIdx ->
+                            insightsInitialSection = secIdx
+                            showInsightsDialog = true
+                        },
                         onSearchQueryChange = { searchQuery = it },
                         onStatusFilterChange = { statusFilter = it },
                         onEntryTypeFilterChange = { entryTypeFilter = it },
@@ -1289,6 +1428,12 @@ fun ExpenseLedgerApp(
                     showShareDialog = false
                     exportPdfLauncher.launch("expense-ledger-statement.pdf")
                 },
+                onExportHtml = { lblId, monthKey ->
+                    pendingHtmlLabelId = lblId
+                    pendingHtmlMonthKey = monthKey
+                    showShareDialog = false
+                    exportHtmlLauncher.launch("expense-ledger-statement.html")
+                },
                 onShareText = { summaryText ->
                     val sendIntent = Intent(Intent.ACTION_SEND).apply {
                         type = "text/plain"
@@ -1300,9 +1445,48 @@ fun ExpenseLedgerApp(
             )
         }
 
+        if (showResetConfirmDialog) {
+            AlertDialog(
+                onDismissRequest = { showResetConfirmDialog = false },
+                title = { Text("Reset Seed Data?") },
+                text = { Text("This restores the default Expense Ledger seed entries, labels, lists, templates, and wallet balances. You can Undo immediately after.") },
+                confirmButton = {
+                    Button(
+                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFDC2626)),
+                        onClick = {
+                            val prev = snapshot
+                            val fresh = dbHelper.createSeedSnapshot().copy(themeMode = snapshot.themeMode)
+                            persist(fresh)
+                            searchQuery = ""
+                            statusFilter = null
+                            entryTypeFilter = null
+                            paymentModeFilter = null
+                            dateWindowFilter = DateWindowFilter.ALL
+                            exactDateFilter = null
+                            pinnedOnlyFilter = false
+                            labelFilterId = null
+                            bulkMode = false
+                            selectedExpenseIds = emptySet()
+                            showDueBanner = true
+                            showResetConfirmDialog = false
+                            showActionSnackbar("Restored default seed data", prev)
+                        }
+                    ) {
+                        Text("Reset Data", color = Color.White)
+                    }
+                },
+                dismissButton = {
+                    TextButton(onClick = { showResetConfirmDialog = false }) {
+                        Text("Cancel")
+                    }
+                }
+            )
+        }
+
         if (showInsightsDialog) {
             InsightsDialog(
                 snapshot = snapshot,
+                initialSection = insightsInitialSection,
                 onUpdateOpeningBalances = { nextBalances ->
                     persist(snapshot.copy(walletStartingBalances = nextBalances))
                     showActionSnackbar("Updated wallet opening balances")
@@ -1626,7 +1810,13 @@ private fun ExpensesScreen(
     labels: List<LabelRecord>,
     lists: List<ListNoteRecord>,
     templates: List<ExpenseTemplateRecord>,
+    liveWallets: List<LiveWalletSummary>,
+    goalProgress: List<GoalProgressSummary>,
+    dueAlertSummary: DueAlertSummary,
+    dueRemindersEnabled: Boolean,
+    showDueBanner: Boolean,
     hideBalances: Boolean,
+    isDark: Boolean,
     searchQuery: String,
     statusFilter: ExpenseStatus?,
     entryTypeFilter: EntryType?,
@@ -1655,6 +1845,8 @@ private fun ExpensesScreen(
     onToggleQuickTemplates: () -> Unit,
     onLogTemplate: (ExpenseTemplateRecord) -> Unit,
     onMoveTemplateToBin: (String) -> Unit,
+    onDismissDueBanner: () -> Unit,
+    onOpenInsightsSection: (Int) -> Unit,
     onCycleStatus: (ExpenseRecord) -> Unit,
     onTogglePin: (ExpenseRecord) -> Unit,
     onPartialPay: (ExpenseRecord) -> Unit,
@@ -1685,6 +1877,7 @@ private fun ExpensesScreen(
                 exp.quote.contains(q, ignoreCase = true) ||
                     exp.paymentMode.label.contains(q, ignoreCase = true) ||
                     formatAmount(exp.balance).contains(q, ignoreCase = true) ||
+                    LedgerMath.formatAmt(exp.balance).contains(q, ignoreCase = true) ||
                     labelHit ||
                     listHit
             }
@@ -1692,104 +1885,364 @@ private fun ExpensesScreen(
         }.sortedByDescending { it.isPinned }
     }
 
+    val chipInactiveBg = if (isDark) Color(0xFF1E293B) else Color(0xFFE2E8F0)
+    val chipInactiveText = if (isDark) Color(0xFF94A3B8) else Color(0xFF334155)
+    val chipActiveBg = Color(0xFF2563EB)
+
     Box(modifier = Modifier.fillMaxSize()) {
         LazyColumn(
             modifier = Modifier.fillMaxSize(),
-            contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 12.dp, bottom = if (bulkMode && selectedExpenseIds.isNotEmpty()) 88.dp else 80.dp),
-            verticalArrangement = Arrangement.spacedBy(12.dp)
+            contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 12.dp, bottom = 104.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp)
         ) {
             item(key = "expenses-filter-bar") {
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    OutlinedTextField(
-                        value = searchQuery,
-                        onValueChange = onSearchQueryChange,
+                    Row(
                         modifier = Modifier.fillMaxWidth(),
-                        singleLine = true,
-                        placeholder = { Text("Search quotes, ₹ amounts, wallets, lists...", fontSize = 13.sp) },
-                        leadingIcon = { Icon(Icons.Default.Search, contentDescription = null, modifier = Modifier.size(18.dp)) },
-                        trailingIcon = {
-                            if (searchQuery.isNotBlank()) {
-                                IconButton(onClick = { onSearchQueryChange("") }) {
-                                    Icon(Icons.Default.Close, contentDescription = "Clear search", modifier = Modifier.size(18.dp))
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        OutlinedTextField(
+                            value = searchQuery,
+                            onValueChange = onSearchQueryChange,
+                            modifier = Modifier.weight(1f),
+                            singleLine = true,
+                            shape = RoundedCornerShape(12.dp),
+                            placeholder = { Text("Search quote, label, mode, amount...", fontSize = 12.sp) },
+                            leadingIcon = { Icon(Icons.Default.Search, contentDescription = null, modifier = Modifier.size(16.dp)) },
+                            trailingIcon = {
+                                if (searchQuery.isNotBlank()) {
+                                    IconButton(onClick = { onSearchQueryChange("") }) {
+                                        Icon(Icons.Default.Close, contentDescription = "Clear search", modifier = Modifier.size(16.dp))
+                                    }
+                                }
+                            }
+                        )
+                        Button(
+                            onClick = onAddFirstExpense,
+                            shape = RoundedCornerShape(12.dp),
+                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2563EB), contentColor = Color.White),
+                            contentPadding = PaddingValues(horizontal = 12.dp, vertical = 14.dp)
+                        ) {
+                            Icon(Icons.Default.Add, contentDescription = null, modifier = Modifier.size(16.dp))
+                            Spacer(Modifier.width(4.dp))
+                            Text("Add Entry", fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+                        }
+                    }
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Row(
+                            modifier = Modifier.weight(1f).horizontalScroll(rememberScrollState()),
+                            horizontalArrangement = Arrangement.spacedBy(6.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            val isAllStatus = statusFilter == null
+                            Surface(
+                                shape = RoundedCornerShape(8.dp),
+                                color = if (isAllStatus) chipActiveBg else chipInactiveBg,
+                                modifier = Modifier.clickable { onStatusFilterChange(null) }
+                            ) {
+                                Text(
+                                    text = "All (${expenses.size})",
+                                    fontSize = 11.sp,
+                                    fontWeight = FontWeight.SemiBold,
+                                    color = if (isAllStatus) Color.White else chipInactiveText,
+                                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
+                                )
+                            }
+                            ExpenseStatus.entries.forEach { s ->
+                                val selected = statusFilter == s
+                                Surface(
+                                    shape = RoundedCornerShape(8.dp),
+                                    color = if (selected) chipActiveBg else chipInactiveBg,
+                                    modifier = Modifier.clickable { onStatusFilterChange(if (selected) null else s) }
+                                ) {
+                                    Text(
+                                        text = s.label,
+                                        fontSize = 11.sp,
+                                        fontWeight = FontWeight.SemiBold,
+                                        color = if (selected) Color.White else chipInactiveText,
+                                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
+                                    )
                                 }
                             }
                         }
-                    )
+                        Spacer(Modifier.width(8.dp))
+                        Surface(
+                            shape = RoundedCornerShape(8.dp),
+                            color = if (bulkMode) Color(0xFF4F46E5) else chipInactiveBg,
+                            modifier = Modifier.clickable { onToggleBulkMode() }
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(4.dp)
+                            ) {
+                                Icon(
+                                    Icons.Default.SelectAll,
+                                    contentDescription = null,
+                                    tint = if (bulkMode) Color.White else chipInactiveText,
+                                    modifier = Modifier.size(13.dp)
+                                )
+                                Text(
+                                    text = if (bulkMode) "Done" else "Select",
+                                    fontSize = 11.sp,
+                                    fontWeight = FontWeight.SemiBold,
+                                    color = if (bulkMode) Color.White else chipInactiveText
+                                )
+                            }
+                        }
+                    }
+
                     Row(
                         modifier = Modifier.horizontalScroll(rememberScrollState()),
                         horizontalArrangement = Arrangement.spacedBy(6.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        FilterChip(
-                            selected = bulkMode,
-                            onClick = onToggleBulkMode,
-                            leadingIcon = { Icon(Icons.Default.SelectAll, contentDescription = null, modifier = Modifier.size(14.dp)) },
-                            label = { Text(if (bulkMode) "Cancel Select" else "Select", fontSize = 11.sp) }
-                        )
                         if (exactDateFilter != null) {
-                            FilterChip(
-                                selected = true,
-                                onClick = onClearExactDate,
-                                label = { Text("Date: $exactDateFilter ×", fontSize = 11.sp) }
-                            )
-                        }
-                        FilterChip(
-                            selected = statusFilter == null && entryTypeFilter == null && paymentModeFilter == null && dateWindowFilter == DateWindowFilter.ALL && exactDateFilter == null && !pinnedOnlyFilter && labelFilterId == null,
-                            onClick = onClearFilters,
-                            label = { Text("All (${expenses.size})", fontSize = 11.sp) }
-                        )
-                        DateWindowFilter.entries.forEach { dw ->
-                            if (dw != DateWindowFilter.ALL) {
-                                FilterChip(
-                                    selected = dateWindowFilter == dw,
-                                    onClick = { onDateWindowFilterChange(if (dateWindowFilter == dw) DateWindowFilter.ALL else dw) },
-                                    label = { Text(dw.label, fontSize = 11.sp) }
+                            Surface(
+                                shape = RoundedCornerShape(8.dp),
+                                color = Color(0xFF059669),
+                                modifier = Modifier.clickable { onClearExactDate() }
+                            ) {
+                                Text(
+                                    text = "Date: $exactDateFilter ×",
+                                    fontSize = 11.sp,
+                                    fontWeight = FontWeight.SemiBold,
+                                    color = Color.White,
+                                    modifier = Modifier.padding(horizontal = 9.dp, vertical = 5.dp)
                                 )
                             }
                         }
-                        FilterChip(
-                            selected = pinnedOnlyFilter,
-                            onClick = { onPinnedOnlyFilterChange(!pinnedOnlyFilter) },
-                            leadingIcon = { Icon(Icons.Default.PushPin, contentDescription = null, modifier = Modifier.size(13.dp)) },
-                            label = { Text("Pinned", fontSize = 11.sp) }
-                        )
-                        FilterChip(
-                            selected = entryTypeFilter == EntryType.INCOME,
-                            onClick = { onEntryTypeFilterChange(if (entryTypeFilter == EntryType.INCOME) null else EntryType.INCOME) },
-                            label = { Text("Income", fontSize = 11.sp) }
-                        )
-                        FilterChip(
-                            selected = entryTypeFilter == EntryType.EXPENSE,
-                            onClick = { onEntryTypeFilterChange(if (entryTypeFilter == EntryType.EXPENSE) null else EntryType.EXPENSE) },
-                            label = { Text("Expense", fontSize = 11.sp) }
-                        )
-                        ExpenseStatus.entries.forEach { s ->
-                            FilterChip(
-                                selected = statusFilter == s,
-                                onClick = { onStatusFilterChange(if (statusFilter == s) null else s) },
-                                label = { Text(s.label, fontSize = 11.sp) }
+                        DateWindowFilter.entries.forEach { dw ->
+                            val selected = dateWindowFilter == dw
+                            Surface(
+                                shape = RoundedCornerShape(8.dp),
+                                color = if (selected) chipActiveBg else chipInactiveBg,
+                                modifier = Modifier.clickable { onDateWindowFilterChange(dw) }
+                            ) {
+                                Text(
+                                    text = dw.label,
+                                    fontSize = 11.sp,
+                                    fontWeight = FontWeight.SemiBold,
+                                    color = if (selected) Color.White else chipInactiveText,
+                                    modifier = Modifier.padding(horizontal = 9.dp, vertical = 5.dp)
+                                )
+                            }
+                        }
+                        Surface(
+                            shape = RoundedCornerShape(8.dp),
+                            color = if (pinnedOnlyFilter) Color(0xFFD97706) else chipInactiveBg,
+                            modifier = Modifier.clickable { onPinnedOnlyFilterChange(!pinnedOnlyFilter) }
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 9.dp, vertical = 5.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(3.dp)
+                            ) {
+                                Icon(
+                                    Icons.Default.PushPin,
+                                    contentDescription = null,
+                                    tint = if (pinnedOnlyFilter) Color.White else chipInactiveText,
+                                    modifier = Modifier.size(12.dp)
+                                )
+                                Text(
+                                    text = "Pinned",
+                                    fontSize = 11.sp,
+                                    fontWeight = FontWeight.SemiBold,
+                                    color = if (pinnedOnlyFilter) Color.White else chipInactiveText
+                                )
+                            }
+                        }
+                        Surface(
+                            shape = RoundedCornerShape(8.dp),
+                            color = if (entryTypeFilter == EntryType.INCOME) Color(0xFF059669) else chipInactiveBg,
+                            modifier = Modifier.clickable { onEntryTypeFilterChange(if (entryTypeFilter == EntryType.INCOME) null else EntryType.INCOME) }
+                        ) {
+                            Text(
+                                text = "Income",
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.SemiBold,
+                                color = if (entryTypeFilter == EntryType.INCOME) Color.White else chipInactiveText,
+                                modifier = Modifier.padding(horizontal = 9.dp, vertical = 5.dp)
+                            )
+                        }
+                        Surface(
+                            shape = RoundedCornerShape(8.dp),
+                            color = if (entryTypeFilter == EntryType.EXPENSE) Color(0xFFDC2626) else chipInactiveBg,
+                            modifier = Modifier.clickable { onEntryTypeFilterChange(if (entryTypeFilter == EntryType.EXPENSE) null else EntryType.EXPENSE) }
+                        ) {
+                            Text(
+                                text = "Expense",
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.SemiBold,
+                                color = if (entryTypeFilter == EntryType.EXPENSE) Color.White else chipInactiveText,
+                                modifier = Modifier.padding(horizontal = 9.dp, vertical = 5.dp)
                             )
                         }
                         PaymentMode.entries.forEach { mode ->
-                            FilterChip(
-                                selected = paymentModeFilter == mode,
-                                onClick = { onPaymentModeFilterChange(if (paymentModeFilter == mode) null else mode) },
-                                label = { Text(mode.label, fontSize = 11.sp) }
-                            )
+                            val selected = paymentModeFilter == mode
+                            Surface(
+                                shape = RoundedCornerShape(8.dp),
+                                color = if (selected) chipActiveBg else chipInactiveBg,
+                                modifier = Modifier.clickable { onPaymentModeFilterChange(if (selected) null else mode) }
+                            ) {
+                                Text(
+                                    text = mode.label,
+                                    fontSize = 11.sp,
+                                    fontWeight = FontWeight.SemiBold,
+                                    color = if (selected) Color.White else chipInactiveText,
+                                    modifier = Modifier.padding(horizontal = 9.dp, vertical = 5.dp)
+                                )
+                            }
                         }
                         labels.forEach { lbl ->
-                            FilterChip(
-                                selected = labelFilterId == lbl.id,
-                                onClick = { onLabelFilterChange(if (labelFilterId == lbl.id) null else lbl.id) },
-                                label = { Text(lbl.name, fontSize = 11.sp) }
-                            )
+                            val selected = labelFilterId == lbl.id
+                            val c = parseColorHex(lbl.colorHex)
+                            Surface(
+                                shape = RoundedCornerShape(8.dp),
+                                color = if (selected) c else chipInactiveBg,
+                                modifier = Modifier.clickable { onLabelFilterChange(if (selected) null else lbl.id) }
+                            ) {
+                                Text(
+                                    text = "#${lbl.name}",
+                                    fontSize = 11.sp,
+                                    fontWeight = FontWeight.SemiBold,
+                                    color = if (selected) Color.White else chipInactiveText,
+                                    modifier = Modifier.padding(horizontal = 9.dp, vertical = 5.dp)
+                                )
+                            }
+                        }
+                    }
+
+                    if (liveWallets.isNotEmpty() || goalProgress.isNotEmpty()) {
+                        Row(
+                            modifier = Modifier.horizontalScroll(rememberScrollState()),
+                            horizontalArrangement = Arrangement.spacedBy(6.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            liveWallets.forEach { w ->
+                                val isNeg = w.current < 0.0
+                                Surface(
+                                    shape = RoundedCornerShape(8.dp),
+                                    color = if (isDark) Color(0xFF0F172A) else Color(0xFFFFFFFF),
+                                    border = androidx.compose.foundation.BorderStroke(1.dp, if (isDark) Color(0xFF1E293B) else Color(0xFFE2E8F0)),
+                                    modifier = Modifier.clickable { onOpenInsightsSection(1) }
+                                ) {
+                                    Row(
+                                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.spacedBy(4.dp)
+                                    ) {
+                                        Text(
+                                            text = w.mode.label,
+                                            fontSize = 10.sp,
+                                            fontWeight = FontWeight.SemiBold,
+                                            color = chipInactiveText
+                                        )
+                                        Text(
+                                            text = (if (isNeg) "-₹" else "₹") + LedgerMath.formatDisplayAmt(kotlin.math.abs(w.current), hideBalances),
+                                            fontSize = 10.sp,
+                                            fontFamily = FontFamily.Monospace,
+                                            fontWeight = FontWeight.Bold,
+                                            color = if (isNeg) Color(0xFFFB7185) else Color(0xFF34D399)
+                                        )
+                                    }
+                                }
+                            }
+                            goalProgress.forEach { gp ->
+                                val pctInt = (gp.pct * 100.0).toInt()
+                                Surface(
+                                    shape = RoundedCornerShape(8.dp),
+                                    color = if (isDark) Color(0xFF0F172A) else Color(0xFFFFFFFF),
+                                    border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFF2563EB).copy(alpha = 0.45f)),
+                                    modifier = Modifier.clickable { onOpenInsightsSection(4) }
+                                ) {
+                                    Row(
+                                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.spacedBy(4.dp)
+                                    ) {
+                                        Text(
+                                            text = "Goal: ${gp.goal.title}",
+                                            fontSize = 10.sp,
+                                            fontWeight = FontWeight.SemiBold,
+                                            color = if (isDark) Color(0xFF93C5FD) else Color(0xFF1D4ED8)
+                                        )
+                                        Text(
+                                            text = "$pctInt%",
+                                            fontSize = 10.sp,
+                                            fontFamily = FontFamily.Monospace,
+                                            fontWeight = FontWeight.Bold,
+                                            color = Color(0xFF34D399)
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if (dueRemindersEnabled && showDueBanner && dueAlertSummary.items.isNotEmpty()) {
+                        val topDue = dueAlertSummary.items.first()
+                        val hasUrgent = dueAlertSummary.overdueCount > 0 || dueAlertSummary.dueTodayCount > 0
+                        val bannerBorder = if (hasUrgent) Color(0xFFF59E0B).copy(alpha = 0.55f) else Color(0xFF2563EB).copy(alpha = 0.45f)
+                        val bannerBg = if (isDark) Color(0xFF451A03).copy(alpha = 0.35f) else Color(0xFFFFFBEB)
+                        val bannerTitleColor = if (isDark) Color(0xFFFCD34D) else Color(0xFF92400E)
+                        val parts = mutableListOf<String>()
+                        if (dueAlertSummary.overdueCount > 0) parts.add("${dueAlertSummary.overdueCount} overdue")
+                        if (dueAlertSummary.dueTodayCount > 0) parts.add("${dueAlertSummary.dueTodayCount} due today")
+                        if (dueAlertSummary.upcomingCount > 0) parts.add("${dueAlertSummary.upcomingCount} upcoming")
+                        Surface(
+                            shape = RoundedCornerShape(12.dp),
+                            color = bannerBg,
+                            border = androidx.compose.foundation.BorderStroke(1.dp, bannerBorder),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text(
+                                        text = "Due Bills Alert · " + parts.joinToString(", "),
+                                        fontSize = 11.sp,
+                                        fontWeight = FontWeight.Bold,
+                                        color = bannerTitleColor
+                                    )
+                                    Text(
+                                        text = "${topDue.expense.quote} (₹${LedgerMath.formatDisplayAmt(topDue.remaining, hideBalances)} · ${topDue.label})",
+                                        fontSize = 10.sp,
+                                        color = bannerTitleColor.copy(alpha = 0.9f),
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                }
+                                Spacer(Modifier.width(6.dp))
+                                Button(
+                                    onClick = { onPartialPay(topDue.expense) },
+                                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF047857), contentColor = Color.White),
+                                    contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp),
+                                    shape = RoundedCornerShape(8.dp)
+                                ) {
+                                    Text("Pay Part", fontSize = 10.sp, fontWeight = FontWeight.SemiBold)
+                                }
+                                IconButton(onClick = onDismissDueBanner, modifier = Modifier.size(24.dp)) {
+                                    Icon(Icons.Default.Close, contentDescription = "Dismiss due alert", tint = bannerTitleColor, modifier = Modifier.size(14.dp))
+                                }
+                            }
                         }
                     }
 
                     if (templates.isNotEmpty()) {
                         Surface(
                             shape = RoundedCornerShape(12.dp),
-                            color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.45f),
+                            color = if (isDark) Color(0xFF0F172A) else Color(0xFFF1F5F9),
+                            border = androidx.compose.foundation.BorderStroke(1.dp, if (isDark) Color(0xFF1E293B) else Color(0xFFE2E8F0)),
                             modifier = Modifier.fillMaxWidth()
                         ) {
                             Column(modifier = Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -1873,7 +2326,11 @@ private fun ExpensesScreen(
 
             if (filteredExpenses.isEmpty()) {
                 item(key = "expenses-empty-filter") {
-                    Card(modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(14.dp)) {
+                    Card(
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(14.dp),
+                        colors = CardDefaults.cardColors(containerColor = if (isDark) Color(0xFF0F172A) else Color(0xFFFFFFFF))
+                    ) {
                         Column(
                             modifier = Modifier.fillMaxWidth().padding(20.dp),
                             horizontalAlignment = Alignment.CenterHorizontally,
@@ -1918,198 +2375,279 @@ private fun ExpensesScreen(
                     LedgerMath.computeDueLabel(exp.dueDate, exp.status, exp.entryType)
                 }
                 val statusColor = when {
-                    isIncome -> Color(0xFF059669)
-                    exp.status == ExpenseStatus.PAID -> Color(0xFF059669)
-                    exp.status == ExpenseStatus.HOLD -> Color(0xFFD97706)
-                    else -> Color(0xFFDC2626)
+                    isIncome -> Color(0xFF34D399)
+                    exp.status == ExpenseStatus.PAID -> Color(0xFF34D399)
+                    exp.status == ExpenseStatus.HOLD -> Color(0xFFFBBF24)
+                    else -> Color(0xFFFB7185)
+                }
+                val statusBg = when {
+                    isIncome -> Color(0xFF064E3B).copy(alpha = if (isDark) 0.55f else 0.16f)
+                    exp.status == ExpenseStatus.PAID -> Color(0xFF064E3B).copy(alpha = if (isDark) 0.55f else 0.16f)
+                    exp.status == ExpenseStatus.HOLD -> Color(0xFF78350F).copy(alpha = if (isDark) 0.55f else 0.16f)
+                    else -> Color(0xFF881337).copy(alpha = if (isDark) 0.55f else 0.16f)
+                }
+                val cardBorderColor = when {
+                    bulkMode && isSelected -> Color(0xFF6366F1)
+                    exp.isPinned -> Color(0xFFF59E0B).copy(alpha = 0.45f)
+                    isDark -> Color(0xFF1E293B)
+                    else -> Color(0xFFE2E8F0)
                 }
 
                 Card(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .then(
-                            if (bulkMode && isSelected) Modifier.border(2.dp, MaterialTheme.colorScheme.primary, RoundedCornerShape(14.dp))
-                            else if (exp.isPinned) Modifier.border(1.dp, Color(0xFF2563EB).copy(alpha = 0.4f), RoundedCornerShape(14.dp))
-                            else Modifier
-                        ),
-                    shape = RoundedCornerShape(14.dp)
+                        .border(if (bulkMode && isSelected) 2.dp else 1.dp, cardBorderColor, RoundedCornerShape(16.dp)),
+                    shape = RoundedCornerShape(16.dp),
+                    colors = CardDefaults.cardColors(containerColor = if (isDark) Color(0xFF0F172A) else Color(0xFFFFFFFF))
                 ) {
                     Column(modifier = Modifier.padding(14.dp)) {
                         Row(
                             modifier = Modifier.fillMaxWidth(),
                             horizontalArrangement = Arrangement.SpaceBetween,
-                            verticalAlignment = Alignment.CenterVertically
+                            verticalAlignment = Alignment.Top
                         ) {
-                            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                                if (bulkMode) {
-                                    Checkbox(
-                                        checked = isSelected,
-                                        onCheckedChange = { onToggleSelectId(exp.id) }
+                            Column(modifier = Modifier.weight(1f)) {
+                                Row(
+                                    modifier = Modifier.horizontalScroll(rememberScrollState()),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                                ) {
+                                    if (bulkMode) {
+                                        Checkbox(
+                                            checked = isSelected,
+                                            onCheckedChange = { onToggleSelectId(exp.id) }
+                                        )
+                                    }
+                                    Text(
+                                        text = (if (isIncome) "+₹" else "₹") + LedgerMath.formatDisplayAmt(exp.balance, hideBalances),
+                                        fontSize = 18.sp,
+                                        fontWeight = FontWeight.Bold,
+                                        fontFamily = FontFamily.Monospace,
+                                        color = if (isIncome) Color(0xFF34D399) else MaterialTheme.colorScheme.onSurface
                                     )
+                                    Text(
+                                        text = if (isIncome) "INCOME" else exp.status.label.uppercase(),
+                                        fontSize = 10.sp,
+                                        fontWeight = FontWeight.Bold,
+                                        color = if (isDark) statusColor else statusColor.copy(alpha = 0.95f),
+                                        modifier = Modifier
+                                            .clip(RoundedCornerShape(6.dp))
+                                            .background(statusBg)
+                                            .clickable { onCycleStatus(exp) }
+                                            .padding(horizontal = 7.dp, vertical = 3.dp)
+                                    )
+                                    Text(
+                                        text = exp.paymentMode.label,
+                                        fontSize = 10.sp,
+                                        fontWeight = FontWeight.Medium,
+                                        color = if (isDark) Color(0xFF94A3B8) else Color(0xFF475569),
+                                        modifier = Modifier
+                                            .background(if (isDark) Color(0xFF1E293B) else Color(0xFFF1F5F9), RoundedCornerShape(6.dp))
+                                            .padding(horizontal = 6.dp, vertical = 3.dp)
+                                    )
+                                    if (exp.isPinned) {
+                                        Text(
+                                            text = "PINNED",
+                                            fontSize = 9.sp,
+                                            fontWeight = FontWeight.Bold,
+                                            color = Color(0xFFFBBF24),
+                                            modifier = Modifier
+                                                .background(Color(0xFF78350F).copy(alpha = 0.45f), RoundedCornerShape(6.dp))
+                                                .padding(horizontal = 6.dp, vertical = 3.dp)
+                                        )
+                                    }
+                                    if (dueLabel != null) {
+                                        val dueColor = when {
+                                            dueLabel.startsWith("Overdue") -> Color(0xFFFB7185)
+                                            dueLabel == "Due Today" -> Color(0xFFFBBF24)
+                                            dueLabel.contains("Settled") -> Color(0xFF34D399)
+                                            else -> Color(0xFF38BDF8)
+                                        }
+                                        Text(
+                                            text = dueLabel,
+                                            fontSize = 9.sp,
+                                            fontWeight = FontWeight.SemiBold,
+                                            color = dueColor,
+                                            modifier = Modifier
+                                                .background(dueColor.copy(alpha = 0.16f), RoundedCornerShape(6.dp))
+                                                .padding(horizontal = 6.dp, vertical = 3.dp)
+                                        )
+                                    }
                                 }
+                                Spacer(Modifier.height(6.dp))
                                 Text(
-                                    text = (if (isIncome) "+₹" else "₹") + LedgerMath.formatDisplayAmt(exp.balance, hideBalances),
-                                    fontSize = 20.sp,
-                                    fontWeight = FontWeight.Bold,
-                                    fontFamily = FontFamily.Monospace,
-                                    color = if (isIncome) Color(0xFF059669) else MaterialTheme.colorScheme.onSurface
+                                    text = exp.quote,
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    color = if (isDark) Color(0xFFE2E8F0) else Color(0xFF1E293B)
                                 )
                             }
-                            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                                Text(
-                                    text = if (isIncome) "INCOME" else exp.status.label.uppercase(),
-                                    fontSize = 11.sp,
-                                    fontWeight = FontWeight.Bold,
-                                    color = statusColor,
-                                    modifier = Modifier
-                                        .clip(RoundedCornerShape(6.dp))
-                                        .background(statusColor.copy(alpha = 0.14f))
-                                        .clickable { onCycleStatus(exp) }
-                                        .padding(horizontal = 8.dp, vertical = 4.dp)
-                                )
-                                IconButton(onClick = { onTogglePin(exp) }, modifier = Modifier.size(28.dp)) {
-                                    Icon(
-                                        imageVector = Icons.Default.PushPin,
-                                        contentDescription = if (exp.isPinned) "Unpin" else "Pin to top",
-                                        tint = if (exp.isPinned) Color(0xFF2563EB) else MaterialTheme.colorScheme.onSurfaceVariant,
-                                        modifier = Modifier.size(15.dp)
-                                    )
-                                }
-                                IconButton(onClick = { onDuplicate(exp) }, modifier = Modifier.size(28.dp)) {
-                                    Icon(Icons.Default.ContentCopy, contentDescription = "Duplicate", modifier = Modifier.size(15.dp))
-                                }
-                                IconButton(onClick = { onEdit(exp) }, modifier = Modifier.size(28.dp)) {
-                                    Icon(Icons.Default.Edit, contentDescription = "Edit", modifier = Modifier.size(16.dp))
-                                }
-                                IconButton(onClick = { onDelete(exp.id) }, modifier = Modifier.size(28.dp)) {
-                                    Icon(Icons.Default.DeleteOutline, contentDescription = "Move to Bin", modifier = Modifier.size(16.dp))
+
+                            if (!bulkMode) {
+                                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(2.dp)) {
+                                    IconButton(onClick = { onTogglePin(exp) }, modifier = Modifier.size(28.dp)) {
+                                        Icon(
+                                            imageVector = Icons.Default.PushPin,
+                                            contentDescription = if (exp.isPinned) "Unpin" else "Pin to top",
+                                            tint = if (exp.isPinned) Color(0xFFFBBF24) else MaterialTheme.colorScheme.onSurfaceVariant,
+                                            modifier = Modifier.size(15.dp)
+                                        )
+                                    }
+                                    IconButton(onClick = { onDuplicate(exp) }, modifier = Modifier.size(28.dp)) {
+                                        Icon(Icons.Default.ContentCopy, contentDescription = "Duplicate", modifier = Modifier.size(15.dp))
+                                    }
+                                    IconButton(onClick = { onEdit(exp) }, modifier = Modifier.size(28.dp)) {
+                                        Icon(Icons.Default.Edit, contentDescription = "Edit", modifier = Modifier.size(16.dp))
+                                    }
+                                    IconButton(onClick = { onDelete(exp.id) }, modifier = Modifier.size(28.dp)) {
+                                        Icon(Icons.Default.DeleteOutline, contentDescription = "Move to Bin", modifier = Modifier.size(16.dp))
+                                    }
                                 }
                             }
                         }
-
-                        Spacer(Modifier.height(6.dp))
-                        Text(exp.quote, style = MaterialTheme.typography.bodyMedium)
 
                         if (!isIncome && exp.status != ExpenseStatus.PAID) {
                             val paidPart = LedgerMath.expensePaidPart(exp)
                             val remPart = LedgerMath.expenseRemainingPart(exp)
                             val pct = if (exp.balance > 0.0) (paidPart / exp.balance).toFloat().coerceIn(0f, 1f) else 0f
-                            Spacer(Modifier.height(6.dp))
+                            Spacer(Modifier.height(8.dp))
                             Surface(
-                                shape = RoundedCornerShape(8.dp),
-                                color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.55f),
+                                shape = RoundedCornerShape(10.dp),
+                                color = if (isDark) Color(0xFF020617).copy(alpha = 0.65f) else Color(0xFFF8FAFC),
+                                border = androidx.compose.foundation.BorderStroke(1.dp, if (isDark) Color(0xFF1E293B) else Color(0xFFE2E8F0)),
                                 modifier = Modifier.fillMaxWidth()
                             ) {
-                                Row(
-                                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
-                                    horizontalArrangement = Arrangement.SpaceBetween,
-                                    verticalAlignment = Alignment.CenterVertically
-                                ) {
-                                    Column(modifier = Modifier.weight(1f)) {
+                                Column(modifier = Modifier.padding(horizontal = 10.dp, vertical = 7.dp)) {
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        horizontalArrangement = Arrangement.SpaceBetween,
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
                                         Text(
-                                            text = "Paid ₹${LedgerMath.formatDisplayAmt(paidPart, hideBalances)} · Rem ₹${LedgerMath.formatDisplayAmt(remPart, hideBalances)}",
+                                            text = "Paid ₹${LedgerMath.formatDisplayAmt(paidPart, hideBalances)}",
                                             fontSize = 11.sp,
                                             fontFamily = FontFamily.Monospace,
-                                            fontWeight = FontWeight.SemiBold
+                                            fontWeight = FontWeight.SemiBold,
+                                            color = Color(0xFF34D399)
                                         )
-                                        if (paidPart > 0.0) {
-                                            Spacer(Modifier.height(3.dp))
-                                            LinearProgressIndicator(
-                                                progress = { pct },
-                                                modifier = Modifier.fillMaxWidth().height(4.dp).clip(RoundedCornerShape(4.dp)),
-                                                color = Color(0xFF059669)
+                                        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                            Text(
+                                                text = "Rem ₹${LedgerMath.formatDisplayAmt(remPart, hideBalances)}",
+                                                fontSize = 11.sp,
+                                                fontFamily = FontFamily.Monospace,
+                                                fontWeight = FontWeight.SemiBold,
+                                                color = Color(0xFFFB7185)
+                                            )
+                                            Button(
+                                                onClick = { onPartialPay(exp) },
+                                                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF047857), contentColor = Color.White),
+                                                shape = RoundedCornerShape(8.dp),
+                                                contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp)
+                                            ) {
+                                                Text("Pay Part", fontSize = 11.sp, fontWeight = FontWeight.SemiBold)
+                                            }
+                                        }
+                                    }
+                                    if (paidPart > 0.0) {
+                                        Spacer(Modifier.height(5.dp))
+                                        LinearProgressIndicator(
+                                            progress = { pct },
+                                            modifier = Modifier.fillMaxWidth().height(5.dp).clip(RoundedCornerShape(4.dp)),
+                                            color = Color(0xFF10B981)
+                                        )
+                                    }
+                                }
+                            }
+                        }
+
+                        if (exp.splitShares.isNotEmpty() || exp.receiptAttachment != null) {
+                            Spacer(Modifier.height(8.dp))
+                            Row(
+                                modifier = Modifier.horizontalScroll(rememberScrollState()),
+                                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                if (exp.splitShares.isNotEmpty()) {
+                                    val splitSum = exp.splitShares.sumOf { it.amount }
+                                    val friendWord = if (exp.splitShares.size > 1) "friends" else "friend"
+                                    Surface(
+                                        shape = RoundedCornerShape(8.dp),
+                                        color = Color(0xFF4F46E5).copy(alpha = 0.16f),
+                                        border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFF6366F1).copy(alpha = 0.4f)),
+                                        modifier = Modifier.clickable { onOpenInsightsSection(3) }
+                                    ) {
+                                        Text(
+                                            text = "Split · ${exp.splitShares.size} $friendWord owe ₹${LedgerMath.formatDisplayAmt(splitSum, hideBalances)}",
+                                            fontSize = 10.sp,
+                                            fontWeight = FontWeight.SemiBold,
+                                            color = if (isDark) Color(0xFFA5B4FC) else Color(0xFF4338CA),
+                                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+                                        )
+                                    }
+                                }
+                                if (exp.receiptAttachment != null) {
+                                    Surface(
+                                        shape = RoundedCornerShape(8.dp),
+                                        color = Color(0xFF0EA5E9).copy(alpha = 0.15f),
+                                        border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFF38BDF8).copy(alpha = 0.4f)),
+                                        modifier = Modifier.clickable { onViewReceipt(exp) }
+                                    ) {
+                                        Row(
+                                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+                                            verticalAlignment = Alignment.CenterVertically,
+                                            horizontalArrangement = Arrangement.spacedBy(4.dp)
+                                        ) {
+                                            Icon(Icons.Default.Image, contentDescription = null, tint = Color(0xFF38BDF8), modifier = Modifier.size(12.dp))
+                                            Text(
+                                                text = "Receipt: ${exp.receiptAttachment.name}",
+                                                fontSize = 10.sp,
+                                                fontWeight = FontWeight.SemiBold,
+                                                color = if (isDark) Color(0xFF7DD3FC) else Color(0xFF0369A1),
+                                                maxLines = 1,
+                                                overflow = TextOverflow.Ellipsis
                                             )
                                         }
                                     }
-                                    Spacer(Modifier.width(8.dp))
-                                    FilledTonalButton(
-                                        onClick = { onPartialPay(exp) },
-                                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp)
-                                    ) {
-                                        Text("Pay Part", fontSize = 11.sp)
-                                    }
                                 }
                             }
                         }
 
-                        if (exp.receiptAttachment != null) {
-                            Spacer(Modifier.height(6.dp))
-                            OutlinedButton(
-                                onClick = { onViewReceipt(exp) },
-                                contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp)
+                        if (exp.labelIds.isNotEmpty()) {
+                            Spacer(Modifier.height(8.dp))
+                            Row(
+                                modifier = Modifier.horizontalScroll(rememberScrollState()),
+                                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                verticalAlignment = Alignment.CenterVertically
                             ) {
-                                Icon(Icons.Default.Image, contentDescription = null, modifier = Modifier.size(14.dp))
-                                Spacer(Modifier.width(4.dp))
-                                Text("Receipt: ${exp.receiptAttachment.name}", fontSize = 11.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                            }
-                        }
-
-                        Spacer(Modifier.height(6.dp))
-                        Row(
-                            modifier = Modifier.horizontalScroll(rememberScrollState()),
-                            horizontalArrangement = Arrangement.spacedBy(6.dp),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Text(
-                                text = exp.paymentMode.label,
-                                fontSize = 10.sp,
-                                fontWeight = FontWeight.SemiBold,
-                                color = MaterialTheme.colorScheme.primary,
-                                modifier = Modifier
-                                    .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.1f), RoundedCornerShape(6.dp))
-                                    .padding(horizontal = 7.dp, vertical = 2.dp)
-                            )
-                            if (exp.splitShares.isNotEmpty()) {
-                                val splitSum = exp.splitShares.sumOf { it.amount }
-                                Text(
-                                    text = "Split ₹${LedgerMath.formatDisplayAmt(splitSum, hideBalances)}",
-                                    fontSize = 10.sp,
-                                    fontWeight = FontWeight.SemiBold,
-                                    color = Color(0xFF7C3AED),
-                                    modifier = Modifier
-                                        .background(Color(0xFF7C3AED).copy(alpha = 0.1f), RoundedCornerShape(6.dp))
-                                        .padding(horizontal = 7.dp, vertical = 2.dp)
-                                )
-                            }
-                            if (exp.isPinned) {
-                                Text(
-                                    text = "PINNED",
-                                    fontSize = 10.sp,
-                                    fontWeight = FontWeight.Bold,
-                                    color = Color(0xFF2563EB),
-                                    modifier = Modifier
-                                        .background(Color(0xFF2563EB).copy(alpha = 0.14f), RoundedCornerShape(6.dp))
-                                        .padding(horizontal = 7.dp, vertical = 2.dp)
-                                )
-                            }
-                            if (dueLabel != null) {
-                                val dueColor = when {
-                                    dueLabel.startsWith("Overdue") || dueLabel == "Due Today" -> Color(0xFFDC2626)
-                                    dueLabel.contains("Settled") -> Color(0xFF059669)
-                                    else -> Color(0xFFD97706)
-                                }
-                                Text(
-                                    text = dueLabel,
-                                    fontSize = 10.sp,
-                                    fontWeight = FontWeight.SemiBold,
-                                    color = dueColor,
-                                    modifier = Modifier
-                                        .background(dueColor.copy(alpha = 0.12f), RoundedCornerShape(6.dp))
-                                        .padding(horizontal = 7.dp, vertical = 2.dp)
-                                )
-                            }
-                            exp.labelIds.forEach { id ->
-                                val lbl = labels.firstOrNull { it.id == id }
-                                if (lbl != null) {
-                                    val c = parseColorHex(lbl.colorHex)
-                                    Text(
-                                        text = lbl.name,
-                                        fontSize = 11.sp,
-                                        color = c,
-                                        modifier = Modifier
-                                            .background(c.copy(alpha = 0.1f), RoundedCornerShape(6.dp))
-                                            .padding(horizontal = 8.dp, vertical = 2.dp)
-                                    )
+                                exp.labelIds.forEach { id ->
+                                    val lbl = labels.firstOrNull { it.id == id }
+                                    if (lbl != null) {
+                                        val c = parseColorHex(lbl.colorHex)
+                                        val isFiltered = labelFilterId == lbl.id
+                                        Surface(
+                                            shape = RoundedCornerShape(6.dp),
+                                            color = c.copy(alpha = if (isFiltered) 0.3f else 0.16f),
+                                            border = androidx.compose.foundation.BorderStroke(1.dp, c.copy(alpha = if (isFiltered) 0.85f else 0.4f)),
+                                            modifier = Modifier.clickable { onLabelFilterChange(if (isFiltered) null else lbl.id) }
+                                        ) {
+                                            Row(
+                                                modifier = Modifier.padding(horizontal = 7.dp, vertical = 3.dp),
+                                                verticalAlignment = Alignment.CenterVertically,
+                                                horizontalArrangement = Arrangement.spacedBy(4.dp)
+                                            ) {
+                                                Box(
+                                                    modifier = Modifier
+                                                        .size(6.dp)
+                                                        .background(c, CircleShape)
+                                                )
+                                                Text(
+                                                    text = "#${lbl.name}",
+                                                    fontSize = 10.sp,
+                                                    fontWeight = FontWeight.Medium,
+                                                    color = if (isDark) Color(0xFFE2E8F0) else Color(0xFF1E293B)
+                                                )
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -2175,6 +2713,8 @@ private fun ExpensesScreen(
                         }
 
                         Spacer(Modifier.height(8.dp))
+                        HorizontalDivider(color = if (isDark) Color(0xFF1E293B) else Color(0xFFE2E8F0))
+                        Spacer(Modifier.height(6.dp))
                         Row(
                             modifier = Modifier
                                 .fillMaxWidth()
@@ -3143,6 +3683,7 @@ private fun ShareSummaryDialog(
     onExportCsv: () -> Unit,
     onImportCsv: () -> Unit,
     onExportPdf: (String?, String?) -> Unit,
+    onExportHtml: (String?, String?) -> Unit,
     onShareText: (String) -> Unit
 ) {
     var selectedLabelId by remember(initialLabelId) { mutableStateOf(initialLabelId) }
@@ -3222,13 +3763,23 @@ private fun ShareSummaryDialog(
                         Text("Import CSV", fontSize = 11.sp)
                     }
                 }
-                OutlinedButton(
-                    onClick = { onExportPdf(selectedLabelId, selectedMonthKey) },
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    Icon(Icons.Default.PictureAsPdf, contentDescription = null, modifier = Modifier.size(15.dp))
-                    Spacer(Modifier.width(6.dp))
-                    Text("Save PDF Statement (.pdf)", fontSize = 11.sp)
+                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OutlinedButton(
+                        onClick = { onExportPdf(selectedLabelId, selectedMonthKey) },
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        Icon(Icons.Default.PictureAsPdf, contentDescription = null, modifier = Modifier.size(15.dp))
+                        Spacer(Modifier.width(4.dp))
+                        Text("PDF (.pdf)", fontSize = 11.sp)
+                    }
+                    OutlinedButton(
+                        onClick = { onExportHtml(selectedLabelId, selectedMonthKey) },
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        Icon(Icons.Default.Description, contentDescription = null, modifier = Modifier.size(15.dp))
+                        Spacer(Modifier.width(4.dp))
+                        Text("Statement (.html)", fontSize = 11.sp)
+                    }
                 }
             }
         },
@@ -3248,6 +3799,7 @@ private fun ShareSummaryDialog(
 @Composable
 private fun InsightsDialog(
     snapshot: LedgerSnapshot,
+    initialSection: Int = 0,
     onUpdateOpeningBalances: (Map<PaymentMode, Double>) -> Unit,
     onCreateTransfer: (PaymentMode, PaymentMode, Double, String) -> Unit,
     onDeleteTransfer: (String) -> Unit,
@@ -3261,7 +3813,7 @@ private fun InsightsDialog(
         LedgerMath.availableMonths(snapshot.expenses).firstOrNull() ?: LedgerMath.nowIso().take(7)
     }
     var monthKey by remember { mutableStateOf(initialMonth) }
-    var activeSection by remember { mutableStateOf(0) } // 0=Budgets,1=Cashflow,2=Forecast,3=Splits,4=Goals,5=Merchants,6=Calendar
+    var activeSection by remember(initialSection) { mutableStateOf(initialSection) } // 0=Budgets,1=Cashflow,2=Forecast,3=Splits,4=Goals,5=Merchants,6=Calendar
     var selectedDateKey by remember { mutableStateOf<String?>(null) }
     var showOpeningEditor by remember { mutableStateOf(false) }
     var showTransferForm by remember { mutableStateOf(false) }

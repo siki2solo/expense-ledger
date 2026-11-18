@@ -511,13 +511,32 @@ object LedgerMath {
         return kotlin.math.round(sum * 100.0) / 100.0
     }
 
-    fun formatAmt(value: Double): String {
+    fun formatPlainAmt(value: Double): String {
         val rounded = kotlin.math.round(value * 100.0) / 100.0
         return if (rounded % 1.0 == 0.0) {
             rounded.toLong().toString()
         } else {
             String.format(Locale.US, "%.2f", rounded)
         }
+    }
+
+    fun formatAmt(value: Double): String {
+        val rounded = kotlin.math.round(value * 100.0) / 100.0
+        val sign = if (rounded < 0.0) "-" else ""
+        val absVal = kotlin.math.abs(rounded)
+        val raw = if (absVal % 1.0 == 0.0) {
+            absVal.toLong().toString()
+        } else {
+            String.format(Locale.US, "%.2f", absVal).trimEnd('0').trimEnd('.')
+        }
+        val parts = raw.split(".")
+        val intPart = parts[0]
+        val decPart = if (parts.size > 1 && parts[1].isNotEmpty()) ".${parts[1]}" else ""
+        if (intPart.length <= 3) return "$sign$intPart$decPart"
+        val lastThree = intPart.takeLast(3)
+        val head = intPart.dropLast(3)
+        val groupedHead = head.reversed().chunked(2).joinToString(",").reversed()
+        return "$sign$groupedHead,$lastThree$decPart"
     }
 
     fun formatDisplayAmt(value: Double, hideBalances: Boolean): String {
@@ -1270,6 +1289,68 @@ object LedgerMath {
         }
     }
 
+    private fun escapeHtml(raw: String): String {
+        return raw
+            .replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+            .replace("\"", "&quot;")
+    }
+
+    fun buildStatementHtml(
+        snapshot: LedgerSnapshot,
+        appName: String,
+        labelId: String? = null,
+        monthKey: String? = null
+    ): String {
+        val targetLabel = labelId?.let { id -> snapshot.labels.firstOrNull { it.id == id } }
+        val filtered = snapshot.expenses.filter { exp ->
+            val matchLbl = targetLabel == null || exp.labelIds.contains(targetLabel.id)
+            val matchMonth = monthKey.isNullOrBlank() || exp.createdAt.startsWith(monthKey)
+            matchLbl && matchMonth
+        }
+        val expOnly = filtered.filter { it.entryType == EntryType.EXPENSE }
+        val paid = expOnly.sumOf { expensePaidPart(it) }
+        val hold = expOnly.filter { it.status == ExpenseStatus.HOLD }.sumOf { expenseRemainingPart(it) }
+        val need = expOnly.filter { it.status == ExpenseStatus.NEED }.sumOf { expenseRemainingPart(it) }
+        val grand = paid + hold + need
+        val cashflow = computeCashflowSummary(filtered)
+        val liveWallets = computeLiveWalletBalances(snapshot)
+        val scopeTitle = targetLabel?.let { "Label ${it.name}" } ?: "All Entries"
+        val periodTitle = if (monthKey.isNullOrBlank()) "All Time" else monthKey
+
+        return buildString {
+            appendLine("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"/>")
+            appendLine("<title>${escapeHtml(appName)} — Financial Statement</title>")
+            appendLine("<style>body{font-family:system-ui,-apple-system,sans-serif;color:#0f172a;margin:28px;}h1{font-size:20px;margin:0 0 4px;}p.sub{color:#475569;font-size:12px;margin:0 0 16px;}.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:16px;}.box{border:1px solid #cbd5e1;border-radius:8px;padding:10px;}.box .k{font-size:10px;font-weight:700;color:#475569;text-transform:uppercase;}.box .v{font-family:monospace;font-size:16px;font-weight:700;margin-top:4px;}table{width:100%;border-collapse:collapse;font-size:12px;}th,td{border-bottom:1px solid #e2e8f0;padding:7px 6px;text-align:left;}th{background:#f8fafc;font-weight:700;}</style>")
+            appendLine("</head><body>")
+            appendLine("<h1>${escapeHtml(appName)} — Financial Statement</h1>")
+            appendLine("<p class=\"sub\">Scope: ${escapeHtml(scopeTitle)} · Period: ${escapeHtml(periodTitle)}</p>")
+            appendLine("<div class=\"grid\">")
+            appendLine("<div class=\"box\"><div class=\"k\">PAID (₹)</div><div class=\"v\">₹${formatAmt(paid)}</div></div>")
+            appendLine("<div class=\"box\"><div class=\"k\">HOLD (₹)</div><div class=\"v\">₹${formatAmt(hold)}</div></div>")
+            appendLine("<div class=\"box\"><div class=\"k\">NEED (₹)</div><div class=\"v\">₹${formatAmt(need)}</div></div>")
+            appendLine("<div class=\"box\"><div class=\"k\">GRAND / NET</div><div class=\"v\">₹${formatAmt(grand)} / ₹${formatAmt(cashflow.netCashflow)}</div></div>")
+            appendLine("</div>")
+            appendLine("<p class=\"sub\">Live Wallets: " + liveWallets.joinToString(" · ") { "<strong>${escapeHtml(it.mode.label)}:</strong> ₹${formatAmt(it.liveBalance)}" } + "</p>")
+            appendLine("<table><thead><tr><th>Date</th><th>Quote</th><th>Type / Status</th><th>Wallet</th><th>Labels</th><th>Amount (₹)</th></tr></thead><tbody>")
+            filtered.forEach { e ->
+                val rem = expenseRemainingPart(e)
+                val statusStr = if (e.entryType == EntryType.INCOME) {
+                    "Income"
+                } else if (e.status != ExpenseStatus.PAID && rem < e.balance) {
+                    "${e.status.label} (₹${formatAmt(rem)} left)"
+                } else {
+                    e.status.label
+                }
+                val lblStr = e.labelIds.mapNotNull { id -> snapshot.labels.firstOrNull { it.id == id }?.name }.joinToString(", ")
+                val amtPrefix = if (e.entryType == EntryType.INCOME) "+" else ""
+                appendLine("<tr><td>${escapeHtml(e.createdAt.take(10))}</td><td>${escapeHtml(e.quote)}</td><td>${escapeHtml(statusStr)}</td><td>${escapeHtml(e.paymentMode.label)}</td><td>${escapeHtml(lblStr)}</td><td style=\"font-family:monospace;font-weight:700;\">${amtPrefix}₹${formatAmt(e.balance)}</td></tr>")
+            }
+            appendLine("</tbody></table></body></html>")
+        }
+    }
+
     fun computeWalletBreakdown(expenses: List<ExpenseRecord>, monthKey: String? = null): List<WalletSummary> {
         val scope = if (monthKey.isNullOrBlank()) expenses else expenses.filter { it.createdAt.startsWith(monthKey) }
         val grandExp = scope.filter { it.entryType == EntryType.EXPENSE }.sumOf { it.balance }
@@ -1463,7 +1544,7 @@ object LedgerMath {
                     exp.id,
                     exp.createdAt,
                     exp.updatedAt,
-                    formatAmt(exp.balance),
+                    formatPlainAmt(exp.balance),
                     exp.status.label,
                     exp.entryType.label,
                     exp.paymentMode.label,
