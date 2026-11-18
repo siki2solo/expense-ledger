@@ -104,6 +104,29 @@ enum class DateWindowFilter(val label: String) {
     MONTH("Month")
 }
 
+enum class ExpenseSortOrder(val label: String) {
+    NEWEST("Newest"),
+    AMOUNT_DESC("Amount ↓"),
+    DUE_ASC("Due Date ↑")
+}
+
+enum class CurrencyCode(val code: String, val symbol: String, val defaultRateToInr: Double) {
+    INR("INR", "₹", 1.0),
+    USD("USD", "$", 84.5),
+    EUR("EUR", "€", 91.2),
+    GBP("GBP", "£", 108.4),
+    AED("AED", "AED ", 23.0),
+    SGD("SGD", "S$", 63.2),
+    JPY("JPY", "¥", 0.56);
+}
+
+data class ChecklistLineRow(
+    val lineIndex: Int,
+    val text: String,
+    val checked: Boolean,
+    val amount: Double
+)
+
 enum class CalendarWeekStart(val key: String, val label: String) {
     MON("mon", "Mon ISO"),
     SUN("sun", "Sun"),
@@ -1706,6 +1729,72 @@ object LedgerMath {
         }
         return CsvImportResult(validEntries, newLabels, skipped, errors)
     }
+
+    fun parseChecklistLines(content: String): List<ChecklistLineRow> {
+        if (content.isBlank()) return emptyList()
+        val rawLines = content.lines()
+        val out = mutableListOf<ChecklistLineRow>()
+        val boxRegex = Regex("""^\s*(?:\[(x|X|\s)\]|(☑|☐|✓))\s*(.*)$""")
+        rawLines.forEachIndexed { idx, raw ->
+            val trimmed = raw.trim()
+            if (trimmed.isNotEmpty()) {
+                val m = boxRegex.find(raw)
+                val checked = if (m != null) {
+                    val box = m.groupValues[1]
+                    val sym = m.groupValues[2]
+                    box.equals("x", ignoreCase = true) || sym == "☑" || sym == "✓"
+                } else false
+                val text = if (m != null) m.groupValues[3].trim().ifEmpty { trimmed } else trimmed
+                val amt = extractNumbersSum(text)
+                out.add(ChecklistLineRow(idx, text, checked, amt))
+            }
+        }
+        return out
+    }
+
+    fun toggleChecklistLine(content: String, lineIndex: Int): String {
+        val rawLines = content.lines().toMutableList()
+        if (lineIndex !in rawLines.indices) return content
+        val target = rawLines[lineIndex]
+        val boxRegex = Regex("""^(\s*)(?:\[(x|X|\s)\]|(☑|☐|✓))\s*(.*)$""")
+        val m = boxRegex.find(target)
+        if (m != null) {
+            val indent = m.groupValues[1]
+            val box = m.groupValues[2]
+            val sym = m.groupValues[3]
+            val rest = m.groupValues[4]
+            val wasChecked = box.equals("x", ignoreCase = true) || sym == "☑" || sym == "✓"
+            rawLines[lineIndex] = "$indent[${if (wasChecked) " " else "x"}] $rest"
+        } else {
+            rawLines[lineIndex] = "[x] ${target.trim()}"
+        }
+        return rawLines.joinToString("\n")
+    }
+
+    fun parseVoicePhrase(spoken: String): ParsedSmsResult {
+        val cleaned = spoken.trim()
+        if (cleaned.isEmpty()) return ParsedSmsResult(false, null, EntryType.EXPENSE, PaymentMode.UPI, "")
+        val numRegex = Regex("""(?:₹|\$|€|£|rs\.?|inr)?\s*(\d{1,3}(?:,\d{3})+|\d+)(?:\.(\d+))?""", RegexOption.IGNORE_CASE)
+        val match = numRegex.find(cleaned) ?: return ParsedSmsResult(false, null, EntryType.EXPENSE, PaymentMode.UPI, cleaned)
+        val whole = match.groupValues[1].replace(",", "")
+        val dec = if (match.groupValues[2].isNotEmpty()) "." + match.groupValues[2] else ""
+        val amt = (whole + dec).toDoubleOrNull() ?: return ParsedSmsResult(false, null, EntryType.EXPENSE, PaymentMode.UPI, cleaned)
+        val lower = cleaned.lowercase(Locale.US)
+        val entryType = if (lower.contains("income") || lower.contains("salary") || lower.contains("received")) EntryType.INCOME else EntryType.EXPENSE
+        val mode = when {
+            lower.contains("cash") -> PaymentMode.CASH
+            lower.contains("card") || lower.contains("credit") || lower.contains("debit") -> PaymentMode.CARD
+            lower.contains("bank") || lower.contains("neft") || lower.contains("imps") -> PaymentMode.BANK
+            else -> PaymentMode.UPI
+        }
+        val quote = cleaned
+            .replace(match.value, " ")
+            .replace(Regex("""\b(paid|hold|need|via|by|using|for|rupees?|rs\.?|inr|upi|cash|card|bank)\b""", RegexOption.IGNORE_CASE), " ")
+            .replace(Regex("""\s+"""), " ")
+            .trim()
+            .ifEmpty { "Voice Entry" }
+        return ParsedSmsResult(true, amt, entryType, mode, quote.replaceFirstChar { it.uppercase() })
+    }
 }
 
 class LedgerDbHelper(context: Context) : SQLiteOpenHelper(context, "expense_ledger.db", null, 1) {
@@ -1752,9 +1841,9 @@ class LedgerDbHelper(context: Context) : SQLiteOpenHelper(context, "expense_ledg
                 }
             }
         }
-        val seed = createSeedSnapshot()
-        saveSnapshot(seed)
-        return seed
+        val empty = createEmptySnapshot()
+        saveSnapshot(empty)
+        return empty
     }
 
     fun saveSnapshot(snapshot: LedgerSnapshot) {
@@ -2337,7 +2426,7 @@ class LedgerDbHelper(context: Context) : SQLiteOpenHelper(context, "expense_ledg
                 autoLockSeconds = autoLockSeconds
             )
         } catch (_: Exception) {
-            createSeedSnapshot()
+            createEmptySnapshot()
         }
     }
 
@@ -2509,7 +2598,38 @@ class LedgerDbHelper(context: Context) : SQLiteOpenHelper(context, "expense_ledg
         }
     }
 
-    private fun createSeedSnapshot(): LedgerSnapshot {
+    fun createEmptySnapshot(): LedgerSnapshot {
+        val zeroBalances = mapOf(
+            PaymentMode.UPI to 0.0,
+            PaymentMode.CASH to 0.0,
+            PaymentMode.CARD to 0.0,
+            PaymentMode.BANK to 0.0
+        )
+        return LedgerSnapshot(
+            expenses = emptyList(),
+            labels = emptyList(),
+            lists = emptyList(),
+            calculatorHistory = emptyList(),
+            templates = emptyList(),
+            bin = emptyList(),
+            binRetentionDays = 30,
+            privacyPinHash = null,
+            hideBalances = false,
+            biometricEnabled = false,
+            themeMode = ThemeMode.SYSTEM,
+            dueRemindersEnabled = true,
+            walletStartingBalances = zeroBalances,
+            walletTransfers = emptyList(),
+            calendarPrefs = CalendarPreferences(CalendarWeekStart.MON, true, CalendarRegionCode.IN),
+            autoLabelRules = emptyList(),
+            iouRepayments = emptyList(),
+            savingsGoals = emptyList(),
+            goalTransactions = emptyList(),
+            autoLockSeconds = 0
+        )
+    }
+
+    fun createSeedSnapshot(): LedgerSnapshot {
         val t1 = "2026-11-10T09:15:00.000Z"
         val t1Sch = "2026-11-10T09:18:00.000Z"
         val t1Veg = "2026-11-10T09:22:00.000Z"

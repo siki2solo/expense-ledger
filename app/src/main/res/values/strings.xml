@@ -9,4 +9,5 @@
     <string name="shortcut_quick_calc_long">Open Quick Calculator</string>
     <string name="shortcut_insights_short">Insights</string>
     <string name="shortcut_insights_long">Open Spending Insights</string>
+    <string name="tile_quick_expense">Log Expense</string>
 </resources>

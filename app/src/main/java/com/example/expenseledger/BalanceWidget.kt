@@ -59,6 +59,17 @@ class BalanceWidget : GlanceAppWidget() {
                 flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
             }
 
+            val addNeedIntent = Intent(ctx, MainActivity::class.java).apply {
+                action = "ACTION_WIDGET_NEW_NEED"
+                putExtra("shortcut_action", "new_need")
+                flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
+            }
+            val addPaidIntent = Intent(ctx, MainActivity::class.java).apply {
+                action = "ACTION_WIDGET_NEW_PAID"
+                putExtra("shortcut_action", "new_paid")
+                flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
+            }
+
             GlanceTheme {
                 Column(
                     modifier = GlanceModifier
@@ -130,14 +141,25 @@ class BalanceWidget : GlanceAppWidget() {
                     Spacer(GlanceModifier.height(8.dp))
                     Row(modifier = GlanceModifier.fillMaxWidth()) {
                         Text(
-                            text = "+ Expense",
+                            text = "+ Need",
                             style = TextStyle(color = ColorProvider(Color(0xFFFFFFFF)), fontSize = 11.sp, fontWeight = FontWeight.Bold),
                             modifier = GlanceModifier
                                 .defaultWeight()
                                 .background(ColorProvider(Color(0xFF1D4ED8)))
                                 .cornerRadius(8.dp)
-                                .padding(horizontal = 10.dp, vertical = 6.dp)
-                                .clickable(actionStartActivity(addIntent))
+                                .padding(horizontal = 8.dp, vertical = 6.dp)
+                                .clickable(actionStartActivity(addNeedIntent))
+                        )
+                        Spacer(GlanceModifier.width(6.dp))
+                        Text(
+                            text = "+ Paid",
+                            style = TextStyle(color = ColorProvider(Color(0xFFFFFFFF)), fontSize = 11.sp, fontWeight = FontWeight.Bold),
+                            modifier = GlanceModifier
+                                .defaultWeight()
+                                .background(ColorProvider(Color(0xFF047857)))
+                                .cornerRadius(8.dp)
+                                .padding(horizontal = 8.dp, vertical = 6.dp)
+                                .clickable(actionStartActivity(addPaidIntent))
                         )
                         Spacer(GlanceModifier.width(6.dp))
                         Text(
@@ -147,7 +169,7 @@ class BalanceWidget : GlanceAppWidget() {
                                 .defaultWeight()
                                 .background(ColorProvider(Color(0xFF1E293B)))
                                 .cornerRadius(8.dp)
-                                .padding(horizontal = 10.dp, vertical = 6.dp)
+                                .padding(horizontal = 8.dp, vertical = 6.dp)
                                 .clickable(actionStartActivity(calIntent))
                         )
                     }
